@@ -273,7 +273,7 @@ jobs:
           echo "sha_tag=sha-${SOURCE_COMMIT::12}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GHCR with the ephemeral workflow token
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
