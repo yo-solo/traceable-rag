@@ -140,7 +140,7 @@ jobs:
           $versionMatch = Select-String -LiteralPath pyproject.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
           if (-not $versionMatch) { throw "project version not found" }
           $version = "v$($versionMatch.Matches[0].Groups[1].Value)"
-          $root = Join-Path $env:RUNNER_TEMP "可验证部署-路径"
+          $root = Join-Path $env:RUNNER_TEMP (-join ([char[]](0x53EF, 0x9A8C, 0x8BC1, 0x90E8, 0x7F72, 0x002D, 0x8DEF, 0x5F84)))
           $release = Join-Path $root "release"
           $stage = Join-Path $root "stage"
           New-Item -ItemType Directory -Force -Path $release, (Join-Path $stage "deploy") | Out-Null

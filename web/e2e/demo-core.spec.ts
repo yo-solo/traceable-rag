@@ -16,7 +16,7 @@ test.describe("Traceable-RAG demo shell", () => {
     await page.goto("/api-reference");
     await expect(page.getByRole("heading", { name: "API 参考", level: 1 })).toBeVisible();
     await expect(page.getByRole("note")).toHaveCount(0);
-    const sidebar = page.getByRole("navigation", { name: /Retrieval API 的侧边栏/ });
+    const sidebar = page.getByRole("complementary", { name: /Retrieval API 的侧边栏/ });
     await expect(sidebar).toBeVisible();
     await expect(sidebar.getByRole("button", { name: /Schemas/ })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /测试请求/ })).toHaveCount(0);
