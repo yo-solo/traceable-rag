@@ -250,7 +250,7 @@ jobs:
           echo "index_tag=$platform_prefix-index" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GHCR only after acceptance passes
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
