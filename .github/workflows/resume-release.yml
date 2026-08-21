@@ -1,0 +1,597 @@
+name: Resume an accepted release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable Git tag to recover, for example v0.5.0
+        required: true
+        type: string
+      source_run_id:
+        description: Failed Release workflow run that uploaded the accepted artifact
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  packages: write
+
+concurrency:
+  group: traceable-rag-release
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate the manual request syntax
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+
+      - name: Check out the immutable release-tag source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and verify the release source commit
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          source_commit=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          test "$(git rev-parse HEAD)" = "$source_commit"
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          source_date_epoch=$(git show -s --format=%ct "$source_commit")
+          [[ "$source_date_epoch" =~ ^[0-9]+$ ]]
+          test "$source_date_epoch" -ge 315532800
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$source_commit" origin/main
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the failed source run and its unique artifact
+        id: provenance
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const runId = Number(process.env.SOURCE_RUN_ID);
+            const expectedArtifact = `traceable-rag-${process.env.RELEASE_TAG}-release`;
+            const { owner, repo } = context.repo;
+            const { data: workflow } = await github.rest.actions.getWorkflow({
+              owner,
+              repo,
+              workflow_id: ".github/workflows/release.yml",
+            });
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: runId,
+            });
+            const problems = [];
+            if (run.repository?.full_name !== `${owner}/${repo}`) problems.push("repository");
+            if (run.head_repository?.full_name !== `${owner}/${repo}`) problems.push("head repository");
+            if (run.workflow_id !== workflow.id || run.path !== workflow.path) problems.push("workflow");
+            if (workflow.path !== ".github/workflows/release.yml") problems.push("workflow path");
+            if (run.event !== "push") problems.push("event");
+            if (run.status !== "completed" || run.conclusion !== "failure") problems.push("conclusion");
+            if (run.head_branch !== process.env.RELEASE_TAG) problems.push("release ref");
+            if (run.head_sha !== process.env.SOURCE_COMMIT) problems.push("head SHA");
+            if (run.id === context.runId) problems.push("self reference");
+            if (problems.length) {
+              core.setFailed(`Source run provenance mismatch: ${problems.join(", ")}`);
+              return;
+            }
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              { owner, repo, run_id: runId, per_page: 100 },
+            );
+            const matches = artifacts.filter((item) => item.name === expectedArtifact);
+            if (
+              matches.length !== 1
+              || matches[0].expired
+              || matches[0].size_in_bytes <= 0
+              || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest || "")
+            ) {
+              core.setFailed(`Expected one live non-empty artifact named ${expectedArtifact}`);
+              return;
+            }
+            core.setOutput("artifact_id", String(matches[0].id));
+            core.setOutput("artifact_name", expectedArtifact);
+            core.setOutput("artifact_digest", matches[0].digest);
+
+      - name: Download only the proven source-run artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.provenance.outputs.artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          path: .artifacts/recovery/source
+          merge-multiple: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Re-verify the accepted artifact without registry access
+        id: accepted
+        env:
+          ARTIFACT_DIR: .artifacts/recovery/source
+          EXPECTED_SOURCE: https://github.com/${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            acceptance.json
+            api-smoke.json
+            local-linux-amd64.json
+            local-linux-arm64.json
+            platform-linux-amd64-descriptor.json
+            platform-linux-amd64-manifest.json
+            platform-linux-arm64-descriptor.json
+            platform-linux-arm64-manifest.json
+            accepted-index-descriptor.json
+            accepted-index.json
+            sbom-linux-amd64.spdx.json
+            sbom-linux-arm64.spdx.json
+            screenshots/retrieval-1440x900.png
+            screenshots/source-480x800.png
+            screenshots/settings-390x844.png
+          )
+          for relative in "${required[@]}"; do
+            test -f "$ARTIFACT_DIR/$relative"
+            test -s "$ARTIFACT_DIR/$relative"
+          done
+          test -z "$(find "$ARTIFACT_DIR" -type l -print -quit)"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["ARTIFACT_DIR"])
+          acceptance = json.loads((root / "acceptance.json").read_text(encoding="utf-8"))
+          if acceptance.get("ok") is not True:
+              raise SystemExit("acceptance report did not pass")
+          if acceptance.get("mode") != "deterministic_public_fixture":
+              raise SystemExit("acceptance report mode is not the public fixture")
+          if acceptance.get("network_access") != "not_used":
+              raise SystemExit("acceptance unexpectedly used network access")
+          expected_count = acceptance.get("expected_document_count")
+          documents = acceptance.get("documents")
+          if expected_count != 4 or acceptance.get("document_count") != expected_count:
+              raise SystemExit("acceptance document count changed")
+          if not isinstance(documents, list) or len(documents) != expected_count:
+              raise SystemExit("acceptance document records are incomplete")
+          if acceptance.get("keyword_index", {}).get("status") != "passed":
+              raise SystemExit("keyword acceptance did not pass")
+          providers = acceptance.get("external_provider_e2e", {})
+          if providers.get("mineru", {}).get("status") != "untested":
+              raise SystemExit("MinerU provider status is not explicitly untested")
+          if providers.get("embedding", {}).get("status") != "untested":
+              raise SystemExit("embedding provider status is not explicitly untested")
+          if any(
+              item.get("processing_status") != "ready"
+              or item.get("managed_storage_verified") is not True
+              for item in documents
+          ):
+              raise SystemExit("an accepted document is not ready and managed")
+
+          smoke = json.loads((root / "api-smoke.json").read_text(encoding="utf-8"))
+          checks = smoke.get("checks")
+          if smoke.get("ok") is not True or smoke.get("expected_document_count") != expected_count:
+              raise SystemExit("API smoke report did not pass")
+          if not isinstance(checks, list) or len(checks) != 5:
+              raise SystemExit("API smoke report does not contain all five probes")
+          for check in checks:
+              if check.get("mode_requested") != "keyword" or check.get("pipeline_used") != "keyword":
+                  raise SystemExit("API smoke did not preserve keyword retrieval")
+              if check.get("degraded") is not False:
+                  raise SystemExit("API smoke contains a degraded probe")
+              if not isinstance(check.get("result_count"), int):
+                  raise SystemExit("API smoke result count is invalid")
+              if not isinstance(check.get("checked_source_ids"), list):
+                  raise SystemExit("API smoke Source checks are invalid")
+
+          expected_source = os.environ["EXPECTED_SOURCE"]
+          for platform in ("amd64", "arm64"):
+              local = json.loads((root / f"local-linux-{platform}.json").read_text(encoding="utf-8"))
+              if not isinstance(local, list) or len(local) != 1:
+                  raise SystemExit(f"invalid local image record for {platform}")
+              labels = local[0].get("Config", {}).get("Labels", {})
+              if labels.get("org.opencontainers.image.source") != expected_source:
+                  raise SystemExit(f"unexpected image source label for {platform}")
+              if labels.get("org.opencontainers.image.licenses") != "MIT":
+                  raise SystemExit(f"unexpected image license label for {platform}")
+
+          for name in ("sbom-linux-amd64.spdx.json", "sbom-linux-arm64.spdx.json"):
+              sbom = json.loads((root / name).read_text(encoding="utf-8"))
+              if not str(sbom.get("spdxVersion", "")).startswith("SPDX-"):
+                  raise SystemExit(f"{name} is not an SPDX document")
+              if not isinstance(sbom.get("packages"), list) or not sbom["packages"]:
+                  raise SystemExit(f"{name} has no packages")
+          for path in (root / "screenshots").glob("*.png"):
+              if not path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
+                  raise SystemExit(f"{path.name} is not a PNG")
+          PY
+          amd64_id=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["Id"])' "$ARTIFACT_DIR/local-linux-amd64.json")
+          arm64_id=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["Id"])' "$ARTIFACT_DIR/local-linux-arm64.json")
+          amd64_digest=$(python scripts/verify_release_image_identity.py platform \
+            --local-image-json "$ARTIFACT_DIR/local-linux-amd64.json" \
+            --descriptor-json "$ARTIFACT_DIR/platform-linux-amd64-descriptor.json" \
+            --manifest-json "$ARTIFACT_DIR/platform-linux-amd64-manifest.json" \
+            --expected-image-id "$amd64_id" \
+            --expected-platform linux/amd64)
+          arm64_digest=$(python scripts/verify_release_image_identity.py platform \
+            --local-image-json "$ARTIFACT_DIR/local-linux-arm64.json" \
+            --descriptor-json "$ARTIFACT_DIR/platform-linux-arm64-descriptor.json" \
+            --manifest-json "$ARTIFACT_DIR/platform-linux-arm64-manifest.json" \
+            --expected-image-id "$arm64_id" \
+            --expected-platform linux/arm64)
+          index_digest=$(python scripts/verify_release_image_identity.py index \
+            --descriptor-json "$ARTIFACT_DIR/accepted-index-descriptor.json" \
+            --index-json "$ARTIFACT_DIR/accepted-index.json" \
+            --expected-platform "linux/amd64=$amd64_digest" \
+            --expected-platform "linux/arm64=$arm64_digest")
+          echo "amd64_id=$amd64_id" >> "$GITHUB_OUTPUT"
+          echo "arm64_id=$arm64_id" >> "$GITHUB_OUTPUT"
+          echo "amd64_digest=$amd64_digest" >> "$GITHUB_OUTPUT"
+          echo "arm64_digest=$arm64_digest" >> "$GITHUB_OUTPUT"
+          echo "index_digest=$index_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Derive release names from the verified source
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/traceable-rag-public"
+          version="${RELEASE_TAG#v}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "minor_tag=${version%.*}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${SOURCE_COMMIT::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GHCR with the ephemeral workflow token
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Match registry objects to the accepted artifact bytes
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          ARTIFACT_DIR: .artifacts/recovery/source
+          AMD64_ID: ${{ steps.accepted.outputs.amd64_id }}
+          ARM64_ID: ${{ steps.accepted.outputs.arm64_id }}
+          AMD64_DIGEST: ${{ steps.accepted.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.accepted.outputs.arm64_digest }}
+          INDEX_DIGEST: ${{ steps.accepted.outputs.index_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          registry=.artifacts/recovery/registry
+          mkdir -p "$registry"
+          for platform in amd64 arm64; do
+            if [ "$platform" = amd64 ]; then
+              digest="$AMD64_DIGEST"
+              image_id="$AMD64_ID"
+            else
+              digest="$ARM64_DIGEST"
+              image_id="$ARM64_ID"
+            fi
+            docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE@$digest" > "$registry/platform-linux-$platform-descriptor.json"
+            docker buildx imagetools inspect --raw "$IMAGE@$digest" > "$registry/platform-linux-$platform-manifest.json"
+            cmp "$ARTIFACT_DIR/platform-linux-$platform-manifest.json" "$registry/platform-linux-$platform-manifest.json"
+            python -c 'import json,sys; assert json.load(open(sys.argv[1])) == json.load(open(sys.argv[2]))' \
+              "$ARTIFACT_DIR/platform-linux-$platform-descriptor.json" \
+              "$registry/platform-linux-$platform-descriptor.json"
+            python scripts/verify_release_image_identity.py platform \
+              --local-image-json "$ARTIFACT_DIR/local-linux-$platform.json" \
+              --descriptor-json "$registry/platform-linux-$platform-descriptor.json" \
+              --manifest-json "$registry/platform-linux-$platform-manifest.json" \
+              --expected-image-id "$image_id" \
+              --expected-platform "linux/$platform" >/dev/null
+          done
+          docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE@$INDEX_DIGEST" > "$registry/accepted-index-descriptor.json"
+          docker buildx imagetools inspect --raw "$IMAGE@$INDEX_DIGEST" > "$registry/accepted-index.json"
+          cmp "$ARTIFACT_DIR/accepted-index.json" "$registry/accepted-index.json"
+          python -c 'import json,sys; assert json.load(open(sys.argv[1])) == json.load(open(sys.argv[2]))' \
+            "$ARTIFACT_DIR/accepted-index-descriptor.json" \
+            "$registry/accepted-index-descriptor.json"
+          python scripts/verify_release_image_identity.py index \
+            --descriptor-json "$registry/accepted-index-descriptor.json" \
+            --index-json "$registry/accepted-index.json" \
+            --expected-platform "linux/amd64=$AMD64_DIGEST" \
+            --expected-platform "linux/arm64=$ARM64_DIGEST" \
+            --expected-index-digest "$INDEX_DIGEST" >/dev/null
+
+      - name: Detect the immutable version image without masking registry errors
+        id: version_state
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          error_file="$RUNNER_TEMP/traceable-rag-resume-version.err"
+          descriptor=.artifacts/recovery/registry/version-descriptor.json
+          if docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$RELEASE_TAG" > "$descriptor" 2>"$error_file"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -Eiq '(manifest unknown|MANIFEST_UNKNOWN|: not found)$' "$error_file"; then
+            rm -f "$descriptor"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$error_file" >&2
+            echo "Could not safely determine whether $IMAGE:$RELEASE_TAG exists" >&2
+            exit 1
+          fi
+
+      - name: Build the eight release assets from verified digests
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source_date_epoch }}
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          AMD64_DIGEST: ${{ steps.accepted.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.accepted.outputs.arm64_digest }}
+          INDEX_DIGEST: ${{ steps.accepted.outputs.index_digest }}
+          ARTIFACT_DIR: .artifacts/recovery/source
+          OUTPUT_DIR: .artifacts/recovery/release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          digest = re.compile(r"sha256:[0-9a-f]{64}")
+          for key in ("AMD64_DIGEST", "ARM64_DIGEST", "INDEX_DIGEST"):
+              if not digest.fullmatch(os.environ[key]):
+                  raise SystemExit(f"{key} is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["SOURCE_COMMIT"]):
+              raise SystemExit("SOURCE_COMMIT is invalid")
+          if not re.fullmatch(r"[0-9]+", os.environ["SOURCE_DATE_EPOCH"]):
+              raise SystemExit("SOURCE_DATE_EPOCH is invalid")
+          payload = {
+              "schema_version": 1,
+              "version": os.environ["RELEASE_TAG"],
+              "image": os.environ["IMAGE"],
+              "index_digest": os.environ["INDEX_DIGEST"],
+              "platforms": {
+                  "linux/amd64": os.environ["AMD64_DIGEST"],
+                  "linux/arm64": os.environ["ARM64_DIGEST"],
+              },
+              "source_commit": os.environ["SOURCE_COMMIT"],
+          }
+          (Path(os.environ["OUTPUT_DIR"]) / "release-manifest.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          cp "$ARTIFACT_DIR/sbom-linux-amd64.spdx.json" "$OUTPUT_DIR/"
+          cp "$ARTIFACT_DIR/sbom-linux-arm64.spdx.json" "$OUTPUT_DIR/"
+          stage=$(mktemp -d "$RUNNER_TEMP/traceable-rag-recovery-$RELEASE_TAG.XXXXXX")
+          cleanup_stage() { rm -rf "$stage"; }
+          trap cleanup_stage EXIT
+          mkdir -p "$stage/deploy"
+          cp deploy/compose.yaml deploy/traceable-rag deploy/traceable-rag.ps1 "$stage/deploy/"
+          cp "$OUTPUT_DIR/release-manifest.json" "$stage/deploy/release-manifest.json"
+          sed "s/@TRACEABLE_RAG_VERSION@/$RELEASE_TAG/g" install.sh > "$stage/install.sh"
+          sed "s/@TRACEABLE_RAG_VERSION@/$RELEASE_TAG/g" install.ps1 > "$stage/install.ps1"
+          find "$stage/deploy" -type d -exec chmod 0755 {} +
+          find "$stage/deploy" -type f -exec chmod 0644 {} +
+          chmod 0755 "$stage/install.sh" "$stage/deploy/traceable-rag"
+          chmod 0644 "$stage/install.ps1"
+          export TZ=UTC LC_ALL=C
+          find "$stage" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+          cp "$stage/install.sh" "$OUTPUT_DIR/install.sh"
+          cp "$stage/install.ps1" "$OUTPUT_DIR/install.ps1"
+          tar \
+            --sort=name \
+            --mtime="@$SOURCE_DATE_EPOCH" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --format=gnu \
+            -C "$stage" \
+            -cf - deploy \
+            | gzip -n > "$OUTPUT_DIR/traceable-rag-deployment-$RELEASE_TAG.tar.gz"
+          (
+            cd "$stage"
+            find deploy -print \
+              | LC_ALL=C sort \
+              | zip -X -q "$GITHUB_WORKSPACE/$OUTPUT_DIR/traceable-rag-deployment-$RELEASE_TAG.zip" -@
+          )
+          (
+            cd "$OUTPUT_DIR"
+            sha256sum \
+              install.sh \
+              install.ps1 \
+              "traceable-rag-deployment-$RELEASE_TAG.tar.gz" \
+              "traceable-rag-deployment-$RELEASE_TAG.zip" \
+              release-manifest.json \
+              sbom-linux-amd64.spdx.json \
+              sbom-linux-arm64.spdx.json > SHA256SUMS
+          )
+
+      - name: Publish or reuse the immutable version image
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERSION_EXISTS: ${{ steps.version_state.outputs.exists }}
+          AMD64_DIGEST: ${{ steps.accepted.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.accepted.outputs.arm64_digest }}
+          INDEX_DIGEST: ${{ steps.accepted.outputs.index_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$VERSION_EXISTS" = false ]; then
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$IMAGE:$RELEASE_TAG" \
+              "$IMAGE@$INDEX_DIGEST"
+          elif [ "$VERSION_EXISTS" != true ]; then
+            echo "Immutable version-tag state is unknown" >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$RELEASE_TAG" > .artifacts/recovery/registry/version-descriptor.json
+          docker buildx imagetools inspect --raw "$IMAGE:$RELEASE_TAG" > .artifacts/recovery/registry/version-index.json
+          cmp .artifacts/recovery/source/accepted-index.json .artifacts/recovery/registry/version-index.json
+          python scripts/verify_release_image_identity.py index \
+            --descriptor-json .artifacts/recovery/registry/version-descriptor.json \
+            --index-json .artifacts/recovery/registry/version-index.json \
+            --expected-platform "linux/amd64=$AMD64_DIGEST" \
+            --expected-platform "linux/arm64=$ARM64_DIGEST" \
+            --expected-index-digest "$INDEX_DIGEST" >/dev/null
+
+      - name: Create or update the draft GitHub Release with exactly eight assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          OUTPUT_DIR: .artifacts/recovery/release
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=(
+            "$OUTPUT_DIR/install.sh"
+            "$OUTPUT_DIR/install.ps1"
+            "$OUTPUT_DIR/traceable-rag-deployment-$RELEASE_TAG.tar.gz"
+            "$OUTPUT_DIR/traceable-rag-deployment-$RELEASE_TAG.zip"
+            "$OUTPUT_DIR/release-manifest.json"
+            "$OUTPUT_DIR/sbom-linux-amd64.spdx.json"
+            "$OUTPUT_DIR/sbom-linux-arm64.spdx.json"
+            "$OUTPUT_DIR/SHA256SUMS"
+          )
+          release_json="$RUNNER_TEMP/traceable-rag-recovery-release.json"
+          release_error="$RUNNER_TEMP/traceable-rag-recovery-release.err"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json" 2>"$release_error"; then
+            jq -e --arg tag "$RELEASE_TAG" '.draft == true and .tag_name == $tag' "$release_json" >/dev/null
+            jq -e '.assets | type == "array"' "$release_json" >/dev/null
+            jq -e '[.assets[].name] | length == (unique | length)' "$release_json" >/dev/null
+            while IFS= read -r existing_name; do
+              expected=false
+              for asset in "${assets[@]}"; do
+                if [ "$(basename "$asset")" = "$existing_name" ]; then
+                  expected=true
+                  break
+                fi
+              done
+              if [ "$expected" != true ]; then
+                echo "Existing draft contains unexpected asset: $existing_name" >&2
+                exit 1
+              fi
+            done < <(jq -r '.assets[].name' "$release_json")
+            missing=()
+            existing_dir=$(mktemp -d "$RUNNER_TEMP/traceable-rag-existing-assets.XXXXXX")
+            cleanup_existing() { rm -rf "$existing_dir"; }
+            trap cleanup_existing EXIT
+            for asset in "${assets[@]}"; do
+              name=$(basename "$asset")
+              asset_id=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' "$release_json")
+              if [ -z "$asset_id" ]; then
+                missing+=("$asset")
+                continue
+              fi
+              gh api \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$existing_dir/$name"
+              cmp "$asset" "$existing_dir/$name"
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "${missing[@]}"
+            fi
+          elif grep -q 'HTTP 404' "$release_error"; then
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --generate-notes \
+              --title "Traceable RAG $RELEASE_TAG"
+          else
+            cat "$release_error" >&2
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
+          python - "$release_json" "$RELEASE_TAG" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          tag = sys.argv[2]
+          expected = {
+              "install.sh",
+              "install.ps1",
+              f"traceable-rag-deployment-{tag}.tar.gz",
+              f"traceable-rag-deployment-{tag}.zip",
+              "release-manifest.json",
+              "sbom-linux-amd64.spdx.json",
+              "sbom-linux-arm64.spdx.json",
+              "SHA256SUMS",
+          }
+          assets = release.get("assets")
+          if release.get("draft") is not True or release.get("tag_name") != tag:
+              raise SystemExit("recovery Release is not the expected draft")
+          if not isinstance(assets, list) or {item.get("name") for item in assets} != expected:
+              raise SystemExit("draft Release does not contain exactly eight expected assets")
+          if any(item.get("state") != "uploaded" or item.get("size", 0) <= 0 for item in assets):
+              raise SystemExit("a draft Release asset is not fully uploaded")
+          PY
+
+      - name: Publish mutable aliases only after the draft Release succeeds
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          MINOR_TAG: ${{ steps.metadata.outputs.minor_tag }}
+          SHA_TAG: ${{ steps.metadata.outputs.sha_tag }}
+          INDEX_DIGEST: ${{ steps.accepted.outputs.index_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "$IMAGE:$MINOR_TAG" \
+            --tag "$IMAGE:$SHA_TAG" \
+            --tag "$IMAGE:latest" \
+            "$IMAGE@$INDEX_DIGEST"
+
+      - name: Verify every recovered mutable alias
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          MINOR_TAG: ${{ steps.metadata.outputs.minor_tag }}
+          SHA_TAG: ${{ steps.metadata.outputs.sha_tag }}
+          INDEX_DIGEST: ${{ steps.accepted.outputs.index_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in "$MINOR_TAG" "$SHA_TAG" latest; do
+            descriptor=".artifacts/recovery/registry/alias-${tag//[^A-Za-z0-9_.-]/_}-descriptor.json"
+            docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$tag" > "$descriptor"
+            python scripts/verify_release_image_identity.py descriptor \
+              --descriptor-json "$descriptor" \
+              --expected-digest "$INDEX_DIGEST" >/dev/null
+          done

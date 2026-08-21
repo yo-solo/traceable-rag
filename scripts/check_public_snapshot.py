@@ -79,7 +79,6 @@ TEXT_SCAN_EXCLUSIONS = {
 FORBIDDEN_TEXT = (
     "example/示例文档",
     "example/mineru 解析结果示例",
-    "traceable-rag-internal",
     "冀北",
     "求职项目叙事",
     "项目路线图与任务清单",
@@ -88,6 +87,15 @@ FORBIDDEN_TEXT = (
 )
 
 FORBIDDEN_TEXT_PATTERNS = (
+    (
+        "non-public GitHub repository reference",
+        re.compile(
+            r"(?:https?://(?:api\.)?github\.com/(?:repos/)?|git@github\.com:)"
+            r"yo-solo/(?!traceable-rag(?:\.git)?(?:[/#?\s\"'<)]|$))"
+            r"[A-Za-z0-9._-]+",
+            re.IGNORECASE,
+        ),
+    ),
     (
         "personal macOS home path",
         re.compile(r"(?<![A-Za-z0-9._-])/Users/[A-Za-z0-9._-]+(?:/|\b)"),

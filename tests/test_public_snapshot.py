@@ -61,6 +61,12 @@ def test_public_snapshot_rejects_private_paths_and_markers(tmp_path):
         f"Transfer artifacts through {nas_host} under {internal_volume}.",
         encoding="utf-8",
     )
+    repository_note = tmp_path / "docs/repository.md"
+    non_public_slug = "/".join(("yo-solo", "private-source-sentinel"))
+    repository_note.write_text(
+        f"Source mirror: https://github.com/{non_public_slug}\n",
+        encoding="utf-8",
+    )
 
     errors = validate_public_snapshot(tmp_path)
 
@@ -70,6 +76,7 @@ def test_public_snapshot_rejects_private_paths_and_markers(tmp_path):
     assert any("vidore-finance-en-mineru-pc-guide.md" in error for error in errors)
     assert any("NAS hostname" in error for error in errors)
     assert any("NAS internal volume path" in error for error in errors)
+    assert any("non-public GitHub repository reference" in error for error in errors)
 
 
 def test_public_snapshot_scans_hidden_config_dockerfile_and_extensionless_scripts(

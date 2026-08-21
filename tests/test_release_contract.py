@@ -301,19 +301,19 @@ def test_release_workflow_preserves_exact_accepted_image_identity() -> None:
     assert assemble_index.count("docker buildx imagetools create") == 1
     assert '"$IMAGE@$AMD64_DIGEST"' in assemble_index
     assert '"$IMAGE@$ARM64_DIGEST"' in assemble_index
-    assert "org.opencontainers.image.revision=$GITHUB_SHA" in assemble_index
-    assert '--expected-source-commit "$GITHUB_SHA"' in assemble_index
+    assert "--annotation" not in assemble_index
+    assert "--expected-source-commit" not in assemble_index
     assert publish_version.count("docker buildx imagetools create") == 1
     assert publish_version.count("--tag") == 1
     assert "--prefer-index=false" in publish_version
     assert '"$IMAGE@$INDEX_DIGEST"' in publish_version
     assert '--expected-index-digest "$INDEX_DIGEST"' in publish_version
-    assert '--expected-source-commit "$GITHUB_SHA"' in publish_version
+    assert "--expected-source-commit" not in publish_version
 
     assert '--expected-platform "linux/amd64=$AMD64_DIGEST"' in verify_version
     assert '--expected-platform "linux/arm64=$ARM64_DIGEST"' in verify_version
     assert '--expected-index-digest "$INDEX_DIGEST"' in verify_version
-    assert '--expected-source-commit "$GITHUB_SHA"' in verify_version
+    assert "--expected-source-commit" not in verify_version
     assert publish_aliases.count("docker buildx imagetools create") == 1
     assert publish_aliases.count("--tag") == 3
     assert '"$IMAGE@$INDEX_DIGEST"' in publish_aliases

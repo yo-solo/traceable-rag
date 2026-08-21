@@ -328,10 +328,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # GHCR may emit a Docker manifest list for accepted Docker v2 platform
+          # manifests. Source identity remains bound by the platform labels and
+          # release-manifest.json instead of unsupported index annotations.
           docker buildx imagetools create \
-            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
-            --annotation "index:org.opencontainers.image.version=$GITHUB_REF_NAME" \
-            --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --tag "$IMAGE:$INDEX_TAG" \
             "$IMAGE@$AMD64_DIGEST" \
             "$IMAGE@$ARM64_DIGEST"
@@ -341,8 +341,7 @@ jobs:
             --descriptor-json .artifacts/release/accepted-index-descriptor.json \
             --index-json .artifacts/release/accepted-index.json \
             --expected-platform "linux/amd64=$AMD64_DIGEST" \
-            --expected-platform "linux/arm64=$ARM64_DIGEST" \
-            --expected-source-commit "$GITHUB_SHA")
+            --expected-platform "linux/arm64=$ARM64_DIGEST")
           echo "digest=$index_digest" >> "$GITHUB_OUTPUT"
 
       - name: Write the accepted release manifest and package installers
@@ -436,8 +435,7 @@ jobs:
               --index-json .artifacts/release/existing-version-index.json \
               --expected-platform "linux/amd64=$AMD64_DIGEST" \
               --expected-platform "linux/arm64=$ARM64_DIGEST" \
-              --expected-index-digest "$INDEX_DIGEST" \
-              --expected-source-commit "$GITHUB_SHA" >/dev/null
+              --expected-index-digest "$INDEX_DIGEST" >/dev/null
             echo "Reusing matching immutable release image $IMAGE:$VERSION_TAG"
           elif [ "$VERSION_EXISTS" = false ]; then
             docker buildx imagetools create \
@@ -467,8 +465,7 @@ jobs:
             --index-json .artifacts/release/image-index.json \
             --expected-platform "linux/amd64=$AMD64_DIGEST" \
             --expected-platform "linux/arm64=$ARM64_DIGEST" \
-            --expected-index-digest "$INDEX_DIGEST" \
-            --expected-source-commit "$GITHUB_SHA")
+            --expected-index-digest "$INDEX_DIGEST")
           printf '%s\n' "$published_digest" > .artifacts/release/image-digest.txt
 
       - name: Publish deployment bundle as GitHub Release assets
