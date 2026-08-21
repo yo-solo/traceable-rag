@@ -472,7 +472,7 @@ jobs:
           printf '%s\n' "$published_digest" > .artifacts/release/image-digest.txt
 
       - name: Publish deployment bundle as GitHub Release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           generate_release_notes: true
