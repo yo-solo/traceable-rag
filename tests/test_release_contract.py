@@ -141,6 +141,26 @@ def test_public_release_uses_an_isolated_ghcr_package() -> None:
     assert expected in _read("install.ps1")
 
 
+def test_windows_ci_keeps_successful_installs_in_private_user_directories() -> None:
+    ci = _read(".github/workflows/ci.yml")
+    windows_job = ci.split("  windows-deployment:", 1)[1].split("\n  security:", 1)[0]
+    packaged_install = _workflow_step(
+        ci, "Run the packaged installer through an iex-equivalent path"
+    )
+    dry_run = _workflow_step(ci, "Dry-run the idempotent Windows installer without Docker")
+    unmarked_directory = _workflow_step(
+        ci, "Refuse to claim an existing unmarked Windows directory"
+    )
+
+    assert windows_job.isascii()
+    assert "$env:LOCALAPPDATA" in packaged_install
+    assert "$env:RUNNER_TEMP" not in packaged_install
+    assert "0x53EF, 0x9A8C, 0x8BC1, 0x90E8, 0x7F72, 0x002D, 0x8DEF, 0x5F84" in packaged_install
+    assert "$env:LOCALAPPDATA" in dry_run
+    assert "$env:RUNNER_TEMP" not in dry_run
+    assert "$env:RUNNER_TEMP" in unmarked_directory
+
+
 def test_release_workflow_preserves_exact_accepted_image_identity() -> None:
     release = _read(".github/workflows/release.yml")
 
