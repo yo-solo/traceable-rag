@@ -248,7 +248,7 @@ jobs:
       - name: Validate the public snapshot boundary
         run: python scripts/check_public_snapshot.py
       - name: Scan committed content for secrets
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v5
