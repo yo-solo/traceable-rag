@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 570 128" role="img" aria-labelledby="title desc">
+  <title id="title">Traceable RAG monochrome lockup</title>
+  <desc id="desc">The monochrome Traceable RAG mark and horizontal wordmark.</desc>
+  <g transform="translate(8 8) scale(.875)">
+    <path d="M12.11 19.15H87.70C100.65 19.15 110.45 29.35 110.45 42.97C110.45 56.28 101.45 65.42 88.24 69.02L105.32 93.15C102.52 94.48 100.64 96.34 99.98 98.70L109.27 98.81L116 108.74L105.22 108.85L104.90 108.53L77.03 68.91L69.02 69.02V108.74H55.89C46.74 108.74 39.98 102.02 39.98 92.51V47.66L39.66 47.13H28.55C19.15 47.13 12.11 40.06 12.11 32.29ZM21.50 28.12C21.50 34.30 24.88 38.16 29.40 38.16H86.42C89.46 38.16 91.23 40.78 91.23 43.86C91.23 45.10 90.83 46.21 90.05 47.13L49.16 47.24V91.44C49.16 96.02 53.34 99.56 59.84 99.56V60.26L86.64 60.16C95.25 60.16 101.48 52.62 101.48 42.97C101.48 34.45 95.10 28.12 87.06 28.12Z" fill="#202033" fill-rule="evenodd"/>
+  </g>
+  <text x="140" y="72" fill="#202033" font-family="Inter, 'SF Pro Display', 'SF Pro Text', 'Noto Sans', Arial, sans-serif" font-size="48" font-weight="720" letter-spacing="-1.2">Traceable</text>
+  <text x="382" y="72" fill="#202033" font-family="Inter, 'SF Pro Display', 'SF Pro Text', 'Noto Sans', Arial, sans-serif" font-size="35" font-weight="430" letter-spacing="4.5">RAG</text>
+</svg>

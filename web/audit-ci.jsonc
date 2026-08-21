@@ -1,0 +1,10 @@
+{
+  "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
+  "high": true,
+  "registry": "https://registry.npmjs.org",
+  "allowlist": [
+    // This SPA uses createBrowserRouter and does not enable React Router RSC mode.
+    // Remove this exception as soon as a patched React Router release is available.
+    "GHSA-qwww-vcr4-c8h2"
+  ]
+}

@@ -1,0 +1,56 @@
+services:
+  traceable-rag:
+    build:
+      context: .
+    image: traceable-rag:local
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${TRACEABLE_RAG_PORT:-8000}:8000"
+    environment:
+      TRACEABLE_RAG_DATABASE_PATH: /data/traceable_v3.db
+      TRACEABLE_RAG_MANAGED_STORAGE_ROOT: /data/managed
+      TRACEABLE_RAG_SETTINGS_PATH: /data/settings.json
+      TRACEABLE_RAG_STATIC_DIR: /app/web/dist
+      TRACEABLE_RAG_PROVIDER_STORE_PATH: /data/providers.db
+      TRACEABLE_RAG_MASTER_KEY_FILE: /run/secrets/traceable-rag-master-key
+      TRACEABLE_RAG_ADMIN_TOKEN_FILE: /run/secrets/traceable-rag-admin-token
+      TRACEABLE_RAG_TRUSTED_HOSTS: 127.0.0.1,localhost,::1
+      TRACEABLE_RAG_MINERU_ADAPTER: ${TRACEABLE_RAG_MINERU_ADAPTER:-}
+      TRACEABLE_RAG_MINERU_BASE_URL: ${TRACEABLE_RAG_MINERU_BASE_URL:-}
+      MINERU_TOKEN: ${MINERU_TOKEN:-}
+      TRACEABLE_RAG_MINERU_MODEL: ${TRACEABLE_RAG_MINERU_MODEL:-}
+      TRACEABLE_RAG_EMBEDDING_ADAPTER: ${TRACEABLE_RAG_EMBEDDING_ADAPTER:-}
+      OPENAI_EMBEDDING_BASE_URL: ${OPENAI_EMBEDDING_BASE_URL:-}
+      OPENAI_EMBEDDING_API_KEY: ${OPENAI_EMBEDDING_API_KEY:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-}
+      OPENAI_EMBEDDING_QUERY_PROMPT: ${OPENAI_EMBEDDING_QUERY_PROMPT:-}
+      TRACEABLE_RAG_RERANKER_ADAPTER: ${TRACEABLE_RAG_RERANKER_ADAPTER:-}
+      TRACEABLE_RAG_RERANKER_BASE_URL: ${TRACEABLE_RAG_RERANKER_BASE_URL:-}
+      TRACEABLE_RAG_RERANKER_API_KEY: ${TRACEABLE_RAG_RERANKER_API_KEY:-}
+      TRACEABLE_RAG_RERANKER_MODEL: ${TRACEABLE_RAG_RERANKER_MODEL:-}
+      TRACEABLE_RAG_LLM_ADAPTER: ${TRACEABLE_RAG_LLM_ADAPTER:-}
+      TRACEABLE_RAG_LLM_BASE_URL: ${TRACEABLE_RAG_LLM_BASE_URL:-}
+      TRACEABLE_RAG_LLM_API_KEY: ${TRACEABLE_RAG_LLM_API_KEY:-}
+      TRACEABLE_RAG_LLM_MODEL: ${TRACEABLE_RAG_LLM_MODEL:-}
+    volumes:
+      - traceable-rag-data:/data
+      - "${TRACEABLE_RAG_DEV_SECRET_DIR:-./.runtime/dev-secrets}/master.key:/run/secrets/traceable-rag-master-key:ro"
+      - "${TRACEABLE_RAG_DEV_SECRET_DIR:-./.runtime/dev-secrets}/admin-token:/run/secrets/traceable-rag-admin-token:ro"
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8000/readyz
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  traceable-rag-data:

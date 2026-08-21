@@ -1,0 +1,555 @@
+name: Release verified multi-architecture image
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: traceable-rag-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Require the release tag commit to come from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - name: Validate release secrets
+        env:
+          MINERU_TOKEN: ${{ secrets.MINERU_TOKEN }}
+          OPENAI_EMBEDDING_BASE_URL: ${{ secrets.OPENAI_EMBEDDING_BASE_URL }}
+          OPENAI_EMBEDDING_API_KEY: ${{ secrets.OPENAI_EMBEDDING_API_KEY }}
+          OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
+        shell: bash
+        run: |
+          test -n "$MINERU_TOKEN"
+          test -n "$OPENAI_EMBEDDING_BASE_URL"
+          test -n "$OPENAI_EMBEDDING_API_KEY"
+          test -n "$OPENAI_EMBEDDING_MODEL"
+
+      - name: Check OpenAPI, Skill, and release contracts
+        run: |
+          python -m pip install -e '.[dev]'
+          python -m pytest -q \
+            tests/test_openapi.py \
+            tests/test_codex_skill_template.py \
+            tests/test_release_contract.py \
+            tests/test_deployment_experience.py
+          sh -n install.sh deploy/traceable-rag
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          python scripts/validate_release_version.py --tag-version "$tag_version"
+
+      - name: Build the candidate image without publishing it
+        id: build_amd64
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/release
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag traceable-rag:candidate \
+            --cache-from type=gha,scope=release-amd64 \
+            --cache-to type=gha,mode=max,scope=release-amd64 \
+            .
+          image_id=$(docker image inspect --format '{{.Id}}' traceable-rag:candidate)
+          platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' traceable-rag:candidate)
+          test "$platform" = linux/amd64
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+
+      - name: Process all four public ViDoRe samples inside the candidate image
+        env:
+          MINERU_TOKEN: ${{ secrets.MINERU_TOKEN }}
+          OPENAI_EMBEDDING_BASE_URL: ${{ secrets.OPENAI_EMBEDDING_BASE_URL }}
+          OPENAI_EMBEDDING_API_KEY: ${{ secrets.OPENAI_EMBEDDING_API_KEY }}
+          OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
+        shell: bash
+        run: |
+          runtime="$RUNNER_TEMP/traceable-rag-release"
+          mkdir -p "$runtime/data/home" "$runtime/data/managed" .artifacts/release/screenshots
+          chmod 0777 "$runtime/data" "$runtime/data/home" "$runtime/data/managed"
+          docker run --rm \
+            --env MINERU_TOKEN \
+            --env OPENAI_EMBEDDING_BASE_URL \
+            --env OPENAI_EMBEDDING_API_KEY \
+            --env OPENAI_EMBEDDING_MODEL \
+            --volume "$GITHUB_WORKSPACE/examples/vidore/documents:/input:ro" \
+            --volume "$runtime/data:/data" \
+            traceable-rag:candidate \
+            python -m traceable_rag.cli acceptance-corpus \
+              --source-dir /input \
+              --db /data/traceable_v3.db \
+              --storage-root /data/managed \
+              --expected-document-count 4 \
+              --processing-attempts 3 \
+              --retry-delay-seconds 15 \
+              --report /data/acceptance.json
+          cp "$runtime/data/acceptance.json" .artifacts/release/acceptance.json
+
+      - name: Start the accepted candidate image
+        env:
+          MINERU_TOKEN: ${{ secrets.MINERU_TOKEN }}
+          OPENAI_EMBEDDING_BASE_URL: ${{ secrets.OPENAI_EMBEDDING_BASE_URL }}
+          OPENAI_EMBEDDING_API_KEY: ${{ secrets.OPENAI_EMBEDDING_API_KEY }}
+          OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
+        shell: bash
+        run: |
+          runtime="$RUNNER_TEMP/traceable-rag-release"
+          mkdir -p "$runtime/secrets"
+          dd if=/dev/urandom of="$runtime/secrets/master.key" bs=32 count=1 status=none
+          openssl rand -hex 32 > "$runtime/secrets/admin-token"
+          chmod 0600 "$runtime/secrets/master.key" "$runtime/secrets/admin-token"
+          docker run --detach \
+            --name traceable-rag-release \
+            --user "$(id -u):$(id -g)" \
+            --publish 127.0.0.1:18001:8000 \
+            --env MINERU_TOKEN \
+            --env OPENAI_EMBEDDING_BASE_URL \
+            --env OPENAI_EMBEDDING_API_KEY \
+            --env OPENAI_EMBEDDING_MODEL \
+            --env TRACEABLE_RAG_PROVIDER_STORE_PATH=/data/providers.db \
+            --env TRACEABLE_RAG_MASTER_KEY_FILE=/run/secrets/traceable-rag-master-key \
+            --env TRACEABLE_RAG_ADMIN_TOKEN_FILE=/run/secrets/traceable-rag-admin-token \
+            --volume "$runtime/data:/data" \
+            --volume "$runtime/secrets/master.key:/run/secrets/traceable-rag-master-key:ro" \
+            --volume "$runtime/secrets/admin-token:/run/secrets/traceable-rag-admin-token:ro" \
+            traceable-rag:candidate
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:18001/readyz >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              docker logs traceable-rag-release
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run public ViDoRe Retrieval and Source acceptance questions
+        run: >-
+          python scripts/release_api_smoke.py
+          --base-url http://127.0.0.1:18001
+          --report .artifacts/release/api-smoke.json
+
+      - name: Capture browser acceptance screenshots
+        working-directory: web
+        shell: bash
+        run: |
+          npx --yes playwright@1.55.0 install --with-deps chromium
+          SOURCE_ID="$(jq -r '.checks[] | .checked_source_ids[0] // empty' ../.artifacts/release/api-smoke.json | head -n 1)"
+          test -n "$SOURCE_ID"
+          npx --yes playwright@1.55.0 screenshot --wait-for-timeout=1500 --viewport-size="1440,900" http://127.0.0.1:18001/retrieval ../.artifacts/release/screenshots/retrieval-1440x900.png
+          npx --yes playwright@1.55.0 screenshot --wait-for-timeout=1500 --viewport-size="480,800" "http://127.0.0.1:18001/sources/$SOURCE_ID" ../.artifacts/release/screenshots/source-480x800.png
+          npx --yes playwright@1.55.0 screenshot --wait-for-timeout=1500 --viewport-size="390,844" http://127.0.0.1:18001/settings ../.artifacts/release/screenshots/settings-390x844.png
+
+      - name: Generate amd64 candidate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: traceable-rag:candidate
+          format: spdx-json
+          output-file: .artifacts/release/sbom-linux-amd64.spdx.json
+
+      - name: Block critical amd64 candidate vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: traceable-rag:candidate
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+
+      - name: Build and run the arm64 candidate under QEMU
+        id: build_arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/arm64 \
+            --load \
+            --tag traceable-rag:candidate-arm64 \
+            --cache-from type=gha,scope=release-arm64 \
+            --cache-to type=gha,mode=max,scope=release-arm64 \
+            .
+          image_id=$(docker image inspect --format '{{.Id}}' traceable-rag:candidate-arm64)
+          platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' traceable-rag:candidate-arm64)
+          test "$platform" = linux/arm64
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          runtime="$RUNNER_TEMP/traceable-rag-arm64-smoke"
+          mkdir -p "$runtime/data/home" "$runtime/data/managed" "$runtime/secrets"
+          dd if=/dev/urandom of="$runtime/secrets/master.key" bs=32 count=1 status=none
+          openssl rand -hex 32 > "$runtime/secrets/admin-token"
+          chmod 0600 "$runtime/secrets/master.key" "$runtime/secrets/admin-token"
+          cleanup_arm64() {
+            docker rm --force traceable-rag-release-arm64 >/dev/null 2>&1 || true
+          }
+          trap cleanup_arm64 EXIT
+          docker run --detach \
+            --name traceable-rag-release-arm64 \
+            --platform linux/arm64 \
+            --user "$(id -u):$(id -g)" \
+            --publish 127.0.0.1:18002:8000 \
+            --env TRACEABLE_RAG_PROVIDER_STORE_PATH=/data/providers.db \
+            --env TRACEABLE_RAG_MASTER_KEY_FILE=/run/secrets/traceable-rag-master-key \
+            --env TRACEABLE_RAG_ADMIN_TOKEN_FILE=/run/secrets/traceable-rag-admin-token \
+            --volume "$runtime/data:/data" \
+            --volume "$runtime/secrets/master.key:/run/secrets/traceable-rag-master-key:ro" \
+            --volume "$runtime/secrets/admin-token:/run/secrets/traceable-rag-admin-token:ro" \
+            traceable-rag:candidate-arm64
+          for attempt in {1..90}; do
+            if curl --fail --silent http://127.0.0.1:18002/readyz >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              docker logs traceable-rag-release-arm64
+              exit 1
+            fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:18002/livez >/dev/null
+          docker exec traceable-rag-release-arm64 libreoffice --version
+
+      - name: Generate arm64 candidate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: traceable-rag:candidate-arm64
+          format: spdx-json
+          output-file: .artifacts/release/sbom-linux-arm64.spdx.json
+
+      - name: Block critical arm64 candidate vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: traceable-rag:candidate-arm64
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+
+      - name: Resolve immutable release tags
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep public releases isolated from any legacy package that may share
+          # the repository name in the same owner namespace.
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/traceable-rag-public"
+          version="${GITHUB_REF_NAME#v}"
+          minor="${version%.*}"
+          sha_tag="sha-${GITHUB_SHA::12}"
+          platform_prefix="sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "version_tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "minor_tag=$minor" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$sha_tag" >> "$GITHUB_OUTPUT"
+          echo "platform_prefix=$platform_prefix" >> "$GITHUB_OUTPUT"
+          echo "index_tag=$platform_prefix-index" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GHCR only after acceptance passes
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect an existing immutable version tag without masking registry errors
+        id: version_state
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          VERSION_TAG: ${{ steps.metadata.outputs.version_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          error_file="$RUNNER_TEMP/traceable-rag-version-inspect.err"
+          if docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$VERSION_TAG" > .artifacts/release/existing-version-descriptor.json 2>"$error_file"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -Eiq '(manifest unknown|MANIFEST_UNKNOWN|: not found)$' "$error_file"; then
+            rm -f .artifacts/release/existing-version-descriptor.json
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$error_file" >&2
+            echo "Could not safely determine whether $IMAGE:$VERSION_TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Push the exact accepted platform images
+        id: platform_digests
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          PLATFORM_PREFIX: ${{ steps.metadata.outputs.platform_prefix }}
+          AMD64_IMAGE_ID: ${{ steps.build_amd64.outputs.image_id }}
+          ARM64_IMAGE_ID: ${{ steps.build_arm64.outputs.image_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          amd64_tag="$PLATFORM_PREFIX-amd64"
+          arm64_tag="$PLATFORM_PREFIX-arm64"
+          test "$(docker image inspect --format '{{.Id}}' traceable-rag:candidate)" = "$AMD64_IMAGE_ID"
+          test "$(docker image inspect --format '{{.Id}}' traceable-rag:candidate-arm64)" = "$ARM64_IMAGE_ID"
+          docker tag traceable-rag:candidate "$IMAGE:$amd64_tag"
+          docker tag traceable-rag:candidate-arm64 "$IMAGE:$arm64_tag"
+          docker push "$IMAGE:$amd64_tag"
+          docker push "$IMAGE:$arm64_tag"
+          docker image inspect traceable-rag:candidate > .artifacts/release/local-linux-amd64.json
+          docker image inspect traceable-rag:candidate-arm64 > .artifacts/release/local-linux-arm64.json
+          docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$amd64_tag" > .artifacts/release/platform-linux-amd64-descriptor.json
+          docker buildx imagetools inspect --raw "$IMAGE:$amd64_tag" > .artifacts/release/platform-linux-amd64-manifest.json
+          docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$arm64_tag" > .artifacts/release/platform-linux-arm64-descriptor.json
+          docker buildx imagetools inspect --raw "$IMAGE:$arm64_tag" > .artifacts/release/platform-linux-arm64-manifest.json
+          amd64_digest=$(python scripts/verify_release_image_identity.py platform \
+            --local-image-json .artifacts/release/local-linux-amd64.json \
+            --descriptor-json .artifacts/release/platform-linux-amd64-descriptor.json \
+            --manifest-json .artifacts/release/platform-linux-amd64-manifest.json \
+            --expected-image-id "$AMD64_IMAGE_ID" \
+            --expected-platform linux/amd64)
+          arm64_digest=$(python scripts/verify_release_image_identity.py platform \
+            --local-image-json .artifacts/release/local-linux-arm64.json \
+            --descriptor-json .artifacts/release/platform-linux-arm64-descriptor.json \
+            --manifest-json .artifacts/release/platform-linux-arm64-manifest.json \
+            --expected-image-id "$ARM64_IMAGE_ID" \
+            --expected-platform linux/arm64)
+          echo "amd64=$amd64_digest" >> "$GITHUB_OUTPUT"
+          echo "arm64=$arm64_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble one accepted index from the platform digests
+        id: accepted_index
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          INDEX_TAG: ${{ steps.metadata.outputs.index_tag }}
+          AMD64_DIGEST: ${{ steps.platform_digests.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.platform_digests.outputs.arm64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.version=$GITHUB_REF_NAME" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --tag "$IMAGE:$INDEX_TAG" \
+            "$IMAGE@$AMD64_DIGEST" \
+            "$IMAGE@$ARM64_DIGEST"
+          docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$INDEX_TAG" > .artifacts/release/accepted-index-descriptor.json
+          docker buildx imagetools inspect --raw "$IMAGE:$INDEX_TAG" > .artifacts/release/accepted-index.json
+          index_digest=$(python scripts/verify_release_image_identity.py index \
+            --descriptor-json .artifacts/release/accepted-index-descriptor.json \
+            --index-json .artifacts/release/accepted-index.json \
+            --expected-platform "linux/amd64=$AMD64_DIGEST" \
+            --expected-platform "linux/arm64=$ARM64_DIGEST" \
+            --expected-source-commit "$GITHUB_SHA")
+          echo "digest=$index_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Write the accepted release manifest and package installers
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          INDEX_DIGEST: ${{ steps.accepted_index.outputs.digest }}
+          AMD64_DIGEST: ${{ steps.platform_digests.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.platform_digests.outputs.arm64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          index_digest="$INDEX_DIGEST"
+          export version index_digest
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          digest_pattern = re.compile(r"sha256:[0-9a-f]{64}")
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?", os.environ["version"]):
+              raise SystemExit("release version is not an exact version tag")
+          for name in ("index_digest", "AMD64_DIGEST", "ARM64_DIGEST"):
+              if not digest_pattern.fullmatch(os.environ[name]):
+                  raise SystemExit(f"{name} is not a sha256 digest")
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["GITHUB_SHA"]):
+              raise SystemExit("GITHUB_SHA is not a full Git commit ID")
+
+          payload = {
+              "schema_version": 1,
+              "version": os.environ["version"],
+              "image": os.environ["IMAGE"],
+              "index_digest": os.environ["index_digest"],
+              "platforms": {
+                  "linux/amd64": os.environ["AMD64_DIGEST"],
+                  "linux/arm64": os.environ["ARM64_DIGEST"],
+              },
+              "source_commit": os.environ["GITHUB_SHA"],
+          }
+          Path(".artifacts/release/release-manifest.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          stage=$(mktemp -d "$RUNNER_TEMP/traceable-rag-deployment-$version.XXXXXX")
+          cleanup_stage() {
+            rm -rf "$stage"
+          }
+          trap cleanup_stage EXIT
+          mkdir -p "$stage/deploy"
+          cp deploy/compose.yaml deploy/traceable-rag deploy/traceable-rag.ps1 "$stage/deploy/"
+          cp .artifacts/release/release-manifest.json "$stage/deploy/release-manifest.json"
+          sed "s/@TRACEABLE_RAG_VERSION@/$version/g" install.sh > "$stage/install.sh"
+          sed "s/@TRACEABLE_RAG_VERSION@/$version/g" install.ps1 > "$stage/install.ps1"
+          chmod 0755 "$stage/install.sh" "$stage/deploy/traceable-rag"
+          cp "$stage/install.sh" .artifacts/release/install.sh
+          cp "$stage/install.ps1" .artifacts/release/install.ps1
+          tar -czf ".artifacts/release/traceable-rag-deployment-$version.tar.gz" -C "$stage" deploy
+          (
+            cd "$stage"
+            zip -q -r "$GITHUB_WORKSPACE/.artifacts/release/traceable-rag-deployment-$version.zip" deploy
+          )
+          (
+            cd .artifacts/release
+            sha256sum \
+              install.sh \
+              install.ps1 \
+              "traceable-rag-deployment-$version.tar.gz" \
+              "traceable-rag-deployment-$version.zip" \
+              release-manifest.json \
+              sbom-linux-amd64.spdx.json \
+              sbom-linux-arm64.spdx.json > SHA256SUMS
+          )
+
+      - name: Publish or reuse the immutable version tag
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          VERSION_TAG: ${{ steps.metadata.outputs.version_tag }}
+          VERSION_EXISTS: ${{ steps.version_state.outputs.exists }}
+          INDEX_DIGEST: ${{ steps.accepted_index.outputs.digest }}
+          AMD64_DIGEST: ${{ steps.platform_digests.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.platform_digests.outputs.arm64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$VERSION_EXISTS" = true ]; then
+            docker buildx imagetools inspect --raw "$IMAGE:$VERSION_TAG" > .artifacts/release/existing-version-index.json
+            python scripts/verify_release_image_identity.py index \
+              --descriptor-json .artifacts/release/existing-version-descriptor.json \
+              --index-json .artifacts/release/existing-version-index.json \
+              --expected-platform "linux/amd64=$AMD64_DIGEST" \
+              --expected-platform "linux/arm64=$ARM64_DIGEST" \
+              --expected-index-digest "$INDEX_DIGEST" \
+              --expected-source-commit "$GITHUB_SHA" >/dev/null
+            echo "Reusing matching immutable release image $IMAGE:$VERSION_TAG"
+          elif [ "$VERSION_EXISTS" = false ]; then
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$IMAGE:$VERSION_TAG" \
+              "$IMAGE@$INDEX_DIGEST"
+          else
+            echo "Could not determine existing version-tag state" >&2
+            exit 1
+          fi
+
+      - name: Verify the published immutable version tag
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          VERSION_TAG: ${{ steps.metadata.outputs.version_tag }}
+          INDEX_DIGEST: ${{ steps.accepted_index.outputs.digest }}
+          AMD64_DIGEST: ${{ steps.platform_digests.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.platform_digests.outputs.arm64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --raw "$IMAGE:$VERSION_TAG" > .artifacts/release/image-index.json
+          docker buildx imagetools inspect "$IMAGE:$VERSION_TAG" > .artifacts/release/image-inspect.txt
+          docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$VERSION_TAG" > .artifacts/release/image-index-descriptor.json
+          published_digest=$(python scripts/verify_release_image_identity.py index \
+            --descriptor-json .artifacts/release/image-index-descriptor.json \
+            --index-json .artifacts/release/image-index.json \
+            --expected-platform "linux/amd64=$AMD64_DIGEST" \
+            --expected-platform "linux/arm64=$ARM64_DIGEST" \
+            --expected-index-digest "$INDEX_DIGEST" \
+            --expected-source-commit "$GITHUB_SHA")
+          printf '%s\n' "$published_digest" > .artifacts/release/image-digest.txt
+
+      - name: Publish deployment bundle as GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            .artifacts/release/install.sh
+            .artifacts/release/install.ps1
+            .artifacts/release/traceable-rag-deployment-${{ github.ref_name }}.tar.gz
+            .artifacts/release/traceable-rag-deployment-${{ github.ref_name }}.zip
+            .artifacts/release/release-manifest.json
+            .artifacts/release/sbom-linux-amd64.spdx.json
+            .artifacts/release/sbom-linux-arm64.spdx.json
+            .artifacts/release/SHA256SUMS
+
+      - name: Publish mutable aliases only after release assets succeed
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          MINOR_TAG: ${{ steps.metadata.outputs.minor_tag }}
+          SHA_TAG: ${{ steps.metadata.outputs.sha_tag }}
+          INDEX_DIGEST: ${{ steps.accepted_index.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "$IMAGE:$MINOR_TAG" \
+            --tag "$IMAGE:$SHA_TAG" \
+            --tag "$IMAGE:latest" \
+            "$IMAGE@$INDEX_DIGEST"
+
+      - name: Verify every mutable alias references the accepted index
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          MINOR_TAG: ${{ steps.metadata.outputs.minor_tag }}
+          SHA_TAG: ${{ steps.metadata.outputs.sha_tag }}
+          INDEX_DIGEST: ${{ steps.accepted_index.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in "$MINOR_TAG" "$SHA_TAG" latest; do
+            descriptor=".artifacts/release/tag-${tag//[^A-Za-z0-9_.-]/_}-descriptor.json"
+            docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE:$tag" > "$descriptor"
+            python scripts/verify_release_image_identity.py descriptor \
+              --descriptor-json "$descriptor" \
+              --expected-digest "$INDEX_DIGEST" >/dev/null
+          done
+
+      - name: Upload acceptance, screenshots, digest, and SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traceable-rag-${{ github.ref_name }}-release
+          path: .artifacts/release/
+          if-no-files-found: warn
+
+      - name: Stop release candidate
+        if: always()
+        run: docker rm --force traceable-rag-release >/dev/null 2>&1 || true

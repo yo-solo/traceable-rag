@@ -1,0 +1,36 @@
+:root {
+  --font-ui: Inter, "SF Pro Display", "SF Pro Text", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: var(--font-ui);
+  --color-canvas: #f6f7fc;
+  --color-surface: #ffffff;
+  --color-surface-glass: rgba(255, 255, 255, 0.72);
+  --color-surface-glass-strong: rgba(255, 255, 255, 0.88);
+  --color-ink: #202033;
+  --color-muted: #6f7187;
+  --color-border: rgba(91, 89, 139, 0.13);
+  --color-border-strong: rgba(107, 101, 216, 0.28);
+  --color-accent: #6b65d8;
+  --color-accent-hover: #5d57c8;
+  --color-accent-pressed: #514bb8;
+  --color-accent-strong: #514bb8;
+  --color-accent-soft: #efedff;
+  --color-accent-faint: rgba(107, 101, 216, 0.08);
+  --color-danger: #bb4e59;
+  --color-danger-soft: #fff0f1;
+  --color-success: #287a5c;
+  --color-success-soft: #eaf7f1;
+  --color-warning: #9a6d24;
+  --color-warning-soft: #fff7e8;
+  --shadow-header: 0 12px 38px rgba(64, 61, 111, 0.09);
+  --shadow-surface: 0 18px 55px rgba(64, 61, 111, 0.1);
+  --shadow-card: 0 10px 30px rgba(64, 61, 111, 0.07);
+  --shadow-focus: 0 0 0 3px rgba(107, 101, 216, 0.22);
+  --radius-control: 11px;
+  --radius-small: 11px;
+  --radius-card: 18px;
+  --radius-medium: 18px;
+  --radius-workbench: 26px;
+  --content-width: 1480px;
+  --header-height: 82px;
+  --transition-fast: 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}

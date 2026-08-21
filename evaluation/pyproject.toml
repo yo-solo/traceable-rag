@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traceable-rag-vidore"
+version = "0.1.0"
+description = "Offline ViDoRe retrieval evaluation for Traceable RAG."
+requires-python = ">=3.10"
+dependencies = [
+  "traceable-rag==0.5.0",
+  "datasets>=3.0",
+  "huggingface-hub>=0.27",
+  "numpy>=1.26",
+  "pyarrow>=18.0",
+  "pytrec-eval-terrier==0.5.10",
+]
+
+[project.scripts]
+traceable-rag-vidore = "evaluation.vidore.cli:main"
+
+[tool.setuptools]
+package-dir = { evaluation = "." }
+packages = ["evaluation", "evaluation.vidore"]
+
+[tool.setuptools.package-data]
+"evaluation.vidore" = ["configs/*.json"]

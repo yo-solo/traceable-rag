@@ -1,0 +1,68 @@
+[
+  [
+    {
+      "type": "title",
+      "content": {
+        "title_content": [
+          {
+            "type": "text",
+            "content": "Inheritance models"
+          }
+        ],
+        "level": 1
+      },
+      "bbox": [80, 70, 720, 125],
+      "page_size": [800, 1000]
+    },
+    {
+      "type": "paragraph",
+      "content": {
+        "paragraph_content": [
+          {
+            "type": "text",
+            "content": "A class can inherit behavior from one or more parent classes."
+          }
+        ]
+      },
+      "bbox": [80, 150, 720, 245],
+      "page_size": [800, 1000]
+    },
+    {
+      "type": "table",
+      "content": {
+        "table_caption": [
+          {
+            "content": "Common inheritance structures"
+          }
+        ],
+        "html": "<table><tr><th>Structure</th><th>Parents</th></tr><tr><td>Hierarchical</td><td>One shared parent</td></tr><tr><td>Multiple</td><td>More than one parent</td></tr></table>",
+        "table_footnote": []
+      },
+      "bbox": [80, 285, 720, 610],
+      "page_size": [800, 1000]
+    }
+  ],
+  [
+    {
+      "type": "paragraph",
+      "content": {
+        "paragraph_content": [
+          {
+            "type": "text",
+            "content": "Method resolution order determines which implementation is selected."
+          }
+        ]
+      },
+      "bbox": [80, 90, 720, 210],
+      "page_size": [800, 1000]
+    },
+    {
+      "type": "equation_interline",
+      "content": {
+        "math_content": "C(A, B) = A + B"
+      },
+      "bbox": [220, 250, 580, 320],
+      "page_size": [800, 1000]
+    }
+  ]
+]

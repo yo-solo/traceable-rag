@@ -1,0 +1,16 @@
+.env
+.env.local
+.DS_Store
+
+.venv
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+storage
+web/node_modules
+web/dist/
+web/*.tsbuildinfo
+.artifacts/
+.runtime/
+.worktrees/

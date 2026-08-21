@@ -1,0 +1,4 @@
+interface:
+  display_name: "Traceable RAG"
+  short_description: "查询知识库并生成可点击的原文级引用"
+  default_prompt: "使用 $traceable-rag 查询知识库，按需扩展上下文，并用可点击的 Source 链接支撑关键陈述。"

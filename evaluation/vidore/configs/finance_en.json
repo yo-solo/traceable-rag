@@ -1,0 +1,17 @@
+{
+  "dataset_id": "vidore/vidore_v3_finance_en",
+  "dataset_revision": "0fe6508053e8aa31b1f1eaec4553f79e3974f59a",
+  "knowledge_base_id": "vidore-v3-finance-en",
+  "knowledge_base_name": "ViDoRe v3 Finance EN",
+  "query_language": "english",
+  "expected_documents": 6,
+  "expected_pages": 2942,
+  "expected_queries": 309,
+  "corpus_page_number_base": 0,
+  "target_tokens": 450,
+  "max_tokens": 700,
+  "top_k_chunks": 10,
+  "top_k_pages": 10,
+  "metrics": ["ndcg@10", "recall@5", "recall@10", "map"],
+  "artifact_root": ".artifacts/vidore/finance_en"
+}

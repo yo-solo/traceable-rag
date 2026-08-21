@@ -1,0 +1,1496 @@
+#!/bin/sh
+set -eu
+
+umask 077
+
+die() {
+  printf 'traceable-rag: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'traceable-rag: warning: %s\n' "$*" >&2
+}
+
+resolve_self() {
+  target=$1
+  if [ -L "$target" ]; then
+    link=$(readlink "$target")
+    case "$link" in
+      /*) target=$link ;;
+      *) target=$(dirname "$target")/$link ;;
+    esac
+  fi
+  CDPATH= cd -- "$(dirname -- "$target")" && pwd
+}
+
+SCRIPT_DIR=$(resolve_self "$0")
+CONFIG_DIR=${TRACEABLE_RAG_CONFIG_DIR:-$SCRIPT_DIR}
+ENV_FILE=$CONFIG_DIR/deployment.env
+COMPOSE_FILE=$CONFIG_DIR/compose.yaml
+RELEASE_MANIFEST_FILE=$CONFIG_DIR/release-manifest.json
+
+usage() {
+  cat <<'EOF'
+Usage: traceable-rag <command> [options]
+
+Commands:
+  start                         Pull the configured fixed image and start it
+  stop                          Stop the service without deleting data
+  status                        Show container and readiness status
+  setup-url                    Show the admin configuration URL on the terminal
+  doctor [--json] [--test-provider ROLE ...]
+                                Inspect installation, live/readiness and provider summary
+  logs [compose logs options]   Show the last 200 log lines by default
+  backup [label]                Create a consistent local snapshot
+  upgrade <vX.Y.Z>              Back up, pull and switch to an exact release
+  rollback                      Restore the image and data from the last upgrade
+  recover                       Recover an interrupted backup, upgrade or rollback
+  agent install-codex [--knowledge-base-id ID] [--adopt-existing]
+                                Install/update the host Codex Skill from the image
+  agent doctor-codex            Verify the host Codex Skill and service URL
+  admin rotate-token            Rotate the admin token and invalidate old setup links
+  uninstall [--purge --yes]     Remove runtime; preserve data unless purge is explicit
+  help                          Show this help
+
+Provider tests run only for explicitly named roles. Supported roles are
+mineru, embedding, reranker and llm.
+EOF
+}
+
+case ${1:-help} in
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+load_config() {
+  [ -f "$ENV_FILE" ] || die "missing $ENV_FILE; run the installer first"
+  [ ! -L "$ENV_FILE" ] || die "$ENV_FILE must not be a symbolic link"
+  [ -f "$COMPOSE_FILE" ] || die "missing $COMPOSE_FILE; run the installer again"
+
+  unset TRACEABLE_RAG_IMAGE_REPOSITORY TRACEABLE_RAG_RELEASE_REPOSITORY TRACEABLE_RAG_RELEASE_VERSION TRACEABLE_RAG_RELEASE_SOURCE_COMMIT TRACEABLE_RAG_IMAGE TRACEABLE_RAG_PROJECT_NAME TRACEABLE_RAG_BIND_ADDRESS TRACEABLE_RAG_PORT TRACEABLE_RAG_READY_TIMEOUT_SECONDS TRACEABLE_RAG_DATA_DIR TRACEABLE_RAG_MASTER_KEY_HOST_FILE TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE TRACEABLE_RAG_STATE_DIR TRACEABLE_RAG_BACKUP_DIR TRACEABLE_RAG_BIN_LINK TRACEABLE_RAG_CONTAINER_UID TRACEABLE_RAG_CONTAINER_GID TRACEABLE_RAG_INSTALLATION_ID || true
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+      *=*) ;;
+      *) die "invalid deployment.env line (expected NAME=VALUE)" ;;
+    esac
+    key=${line%%=*}
+    value=${line#*=}
+    case "$value" in
+      *\$*|*#*) die "deployment values cannot contain dollar signs or #" ;;
+    esac
+    case "$key" in
+      TRACEABLE_RAG_IMAGE_REPOSITORY|TRACEABLE_RAG_RELEASE_REPOSITORY|TRACEABLE_RAG_RELEASE_VERSION|TRACEABLE_RAG_RELEASE_SOURCE_COMMIT|TRACEABLE_RAG_IMAGE|TRACEABLE_RAG_PROJECT_NAME|TRACEABLE_RAG_BIND_ADDRESS|TRACEABLE_RAG_PORT|TRACEABLE_RAG_READY_TIMEOUT_SECONDS|TRACEABLE_RAG_DATA_DIR|TRACEABLE_RAG_MASTER_KEY_HOST_FILE|TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE|TRACEABLE_RAG_STATE_DIR|TRACEABLE_RAG_BACKUP_DIR|TRACEABLE_RAG_BIN_LINK|TRACEABLE_RAG_CONTAINER_UID|TRACEABLE_RAG_CONTAINER_GID|TRACEABLE_RAG_INSTALLATION_ID)
+        export "$key=$value"
+        ;;
+      *) die "unsupported deployment setting: $key" ;;
+    esac
+  done < "$ENV_FILE"
+
+  : "${TRACEABLE_RAG_IMAGE_REPOSITORY:?missing TRACEABLE_RAG_IMAGE_REPOSITORY}"
+  : "${TRACEABLE_RAG_RELEASE_REPOSITORY:?missing TRACEABLE_RAG_RELEASE_REPOSITORY}"
+  : "${TRACEABLE_RAG_RELEASE_VERSION:?missing TRACEABLE_RAG_RELEASE_VERSION}"
+  : "${TRACEABLE_RAG_IMAGE:?missing TRACEABLE_RAG_IMAGE}"
+  : "${TRACEABLE_RAG_PROJECT_NAME:?missing TRACEABLE_RAG_PROJECT_NAME}"
+  : "${TRACEABLE_RAG_BIND_ADDRESS:?missing TRACEABLE_RAG_BIND_ADDRESS}"
+  : "${TRACEABLE_RAG_PORT:?missing TRACEABLE_RAG_PORT}"
+  : "${TRACEABLE_RAG_READY_TIMEOUT_SECONDS:?missing TRACEABLE_RAG_READY_TIMEOUT_SECONDS}"
+  : "${TRACEABLE_RAG_DATA_DIR:?missing TRACEABLE_RAG_DATA_DIR}"
+  : "${TRACEABLE_RAG_MASTER_KEY_HOST_FILE:?missing TRACEABLE_RAG_MASTER_KEY_HOST_FILE}"
+  : "${TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE:?missing TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE}"
+  : "${TRACEABLE_RAG_STATE_DIR:?missing TRACEABLE_RAG_STATE_DIR}"
+  : "${TRACEABLE_RAG_BACKUP_DIR:?missing TRACEABLE_RAG_BACKUP_DIR}"
+  : "${TRACEABLE_RAG_CONTAINER_UID:?missing TRACEABLE_RAG_CONTAINER_UID}"
+  : "${TRACEABLE_RAG_CONTAINER_GID:?missing TRACEABLE_RAG_CONTAINER_GID}"
+  : "${TRACEABLE_RAG_INSTALLATION_ID:?missing TRACEABLE_RAG_INSTALLATION_ID}"
+}
+
+manifest_string() {
+  file=$1
+  key=$2
+  sed -n "s/^[[:space:]]*\"$key\":[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | sed -n '1p'
+}
+
+validate_release_manifest_file() {
+  manifest_file=$1
+  expected_version=$2
+  [ -f "$manifest_file" ] && [ ! -L "$manifest_file" ] || die "release manifest is missing or unsafe: $manifest_file"
+  RELEASE_MANIFEST_VERSION=$(manifest_string "$manifest_file" version)
+  release_manifest_schema=$(sed -n 's/^[[:space:]]*"schema_version":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$manifest_file" | sed -n '1p')
+  RELEASE_MANIFEST_IMAGE=$(manifest_string "$manifest_file" image)
+  RELEASE_MANIFEST_DIGEST=$(manifest_string "$manifest_file" index_digest)
+  RELEASE_MANIFEST_SOURCE_COMMIT=$(manifest_string "$manifest_file" source_commit)
+  release_manifest_amd64=$(sed -n 's/^[[:space:]]*"linux\/amd64":[[:space:]]*"\(sha256:[0-9a-f]*\)".*/\1/p' "$manifest_file" | sed -n '1p')
+  release_manifest_arm64=$(sed -n 's/^[[:space:]]*"linux\/arm64":[[:space:]]*"\(sha256:[0-9a-f]*\)".*/\1/p' "$manifest_file" | sed -n '1p')
+  [ "$release_manifest_schema" = 1 ] || die "unsupported release manifest schema version"
+  [ "$RELEASE_MANIFEST_VERSION" = "$expected_version" ] || die "release manifest version mismatch"
+  [ "$RELEASE_MANIFEST_IMAGE" = "$TRACEABLE_RAG_IMAGE_REPOSITORY" ] || die "release manifest image repository mismatch"
+  printf '%s\n' "$RELEASE_MANIFEST_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' || die "release manifest index digest is invalid"
+  printf '%s\n' "$release_manifest_amd64" | grep -Eq '^sha256:[0-9a-f]{64}$' || die "release manifest linux/amd64 digest is invalid"
+  printf '%s\n' "$release_manifest_arm64" | grep -Eq '^sha256:[0-9a-f]{64}$' || die "release manifest linux/arm64 digest is invalid"
+  printf '%s\n' "$RELEASE_MANIFEST_SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' || die "release manifest source commit is invalid"
+  export RELEASE_MANIFEST_VERSION RELEASE_MANIFEST_IMAGE RELEASE_MANIFEST_DIGEST RELEASE_MANIFEST_SOURCE_COMMIT
+}
+
+validate_installed_release_identity() {
+  if [ -n "${TRACEABLE_RAG_RELEASE_SOURCE_COMMIT:-}" ] || [ -e "$RELEASE_MANIFEST_FILE" ]; then
+    [ -n "${TRACEABLE_RAG_RELEASE_SOURCE_COMMIT:-}" ] || die "release manifest exists but deployment.env has no source commit"
+    validate_release_manifest_file "$RELEASE_MANIFEST_FILE" "$TRACEABLE_RAG_RELEASE_VERSION"
+    [ "$TRACEABLE_RAG_RELEASE_SOURCE_COMMIT" = "$RELEASE_MANIFEST_SOURCE_COMMIT" ] || die "release source commit does not match the installed manifest"
+    [ "$TRACEABLE_RAG_IMAGE" = "$RELEASE_MANIFEST_IMAGE@$RELEASE_MANIFEST_DIGEST" ] || die "configured image digest does not match the installed release manifest"
+  fi
+}
+
+is_absolute_path() {
+  case $1 in
+    /*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_config() {
+  grep -Eq '^ghcr\.io/[a-z0-9._/-]+$' <<EOF || die "image repository must be a GHCR repository"
+$TRACEABLE_RAG_IMAGE_REPOSITORY
+EOF
+  grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' <<EOF || die "release repository must be owner/name"
+$TRACEABLE_RAG_RELEASE_REPOSITORY
+EOF
+  grep -Eq '^ghcr\.io/[a-z0-9._/-]+(:v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?|@sha256:[0-9a-f]{64})$' <<EOF || die "image must use an exact vX.Y.Z tag or sha256 digest; latest is forbidden"
+$TRACEABLE_RAG_IMAGE
+EOF
+  grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$' <<EOF || die "release version must be an exact vX.Y.Z value"
+$TRACEABLE_RAG_RELEASE_VERSION
+EOF
+  case "$TRACEABLE_RAG_IMAGE" in
+    "$TRACEABLE_RAG_IMAGE_REPOSITORY":*|"$TRACEABLE_RAG_IMAGE_REPOSITORY"@*) ;;
+    *) die "configured image must belong to $TRACEABLE_RAG_IMAGE_REPOSITORY" ;;
+  esac
+  grep -Eq '^[a-z0-9][a-z0-9_-]*$' <<EOF || die "invalid Compose project name"
+$TRACEABLE_RAG_PROJECT_NAME
+EOF
+  case "$TRACEABLE_RAG_PORT" in
+    ''|*[!0-9]*) die "port must be an integer" ;;
+  esac
+  case "$TRACEABLE_RAG_READY_TIMEOUT_SECONDS" in
+    ''|*[!0-9]*) die "readiness timeout must be numeric" ;;
+  esac
+  case "$TRACEABLE_RAG_CONTAINER_UID:$TRACEABLE_RAG_CONTAINER_GID" in
+    *[!0-9:]*|:*|*:) die "container UID/GID must be numeric" ;;
+  esac
+  [ "$TRACEABLE_RAG_CONTAINER_UID" -gt 0 ] || die "container UID 0 is forbidden"
+  grep -Fq "user: \"$TRACEABLE_RAG_CONTAINER_UID:$TRACEABLE_RAG_CONTAINER_GID\"" "$COMPOSE_FILE" || die "Compose user does not match the installed non-root UID/GID"
+  grep -Eq '^[0-9a-f]{32}$' <<EOF || die "installation ID is invalid"
+$TRACEABLE_RAG_INSTALLATION_ID
+EOF
+  case "$TRACEABLE_RAG_BIND_ADDRESS" in
+    127.0.0.1|::1) ;;
+    *) die "non-loopback binding is not supported by the bundled deployment" ;;
+  esac
+  [ "$TRACEABLE_RAG_PORT" -ge 1 ] && [ "$TRACEABLE_RAG_PORT" -le 65535 ] || die "port must be between 1 and 65535"
+  [ "$TRACEABLE_RAG_READY_TIMEOUT_SECONDS" -ge 30 ] && [ "$TRACEABLE_RAG_READY_TIMEOUT_SECONDS" -le 86400 ] || die "readiness timeout must be between 30 and 86400 seconds"
+  for path in "$TRACEABLE_RAG_DATA_DIR" "$TRACEABLE_RAG_MASTER_KEY_HOST_FILE" "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE" "$TRACEABLE_RAG_STATE_DIR" "$TRACEABLE_RAG_BACKUP_DIR"; do
+    is_absolute_path "$path" || die "deployment paths must be absolute: $path"
+  done
+  case "$TRACEABLE_RAG_BACKUP_DIR/" in "$CONFIG_DIR/"*|"$TRACEABLE_RAG_DATA_DIR/"*) die "backup directory must not be inside config or data" ;; esac
+  case "$TRACEABLE_RAG_DATA_DIR/" in "$CONFIG_DIR/"*|"$TRACEABLE_RAG_STATE_DIR/"*|"$TRACEABLE_RAG_BACKUP_DIR/"*) die "data directory must remain independent from config, state and backups" ;; esac
+  [ "$TRACEABLE_RAG_DATA_DIR" != / ] || die "data directory cannot be /"
+  [ -d "$TRACEABLE_RAG_DATA_DIR" ] || die "data directory does not exist: $TRACEABLE_RAG_DATA_DIR"
+  [ -f "$TRACEABLE_RAG_MASTER_KEY_HOST_FILE" ] || die "master key is missing"
+  [ ! -L "$TRACEABLE_RAG_MASTER_KEY_HOST_FILE" ] || die "master key must not be a symbolic link"
+  key_bytes=$(wc -c < "$TRACEABLE_RAG_MASTER_KEY_HOST_FILE" | tr -d ' ')
+  [ "$key_bytes" = 32 ] || die "master key must contain exactly 32 raw bytes"
+  [ -f "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE" ] || die "admin token is missing"
+  [ ! -L "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE" ] || die "admin token must not be a symbolic link"
+  token_bytes=$(wc -c < "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE" | tr -d ' ')
+  [ "$token_bytes" = 64 ] || die "admin token must be 64 hex characters (32 random bytes)"
+  grep -Eq '^[0-9a-f]{64}$' "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE" || die "admin token has an invalid format"
+  if grep -Eq '^(MINERU_TOKEN|MINERU_API_KEY|OPENAI_EMBEDDING_API_KEY|TRACEABLE_RAG_EMBEDDING_API_KEY|OPENAI_API_KEY)=' "$ENV_FILE"; then
+    die "Provider credentials are forbidden in deployment.env"
+  fi
+  verify_installation_markers
+  validate_installed_release_identity
+}
+
+verify_installation_markers() {
+  for owned_dir in "$CONFIG_DIR" "$TRACEABLE_RAG_DATA_DIR" "$TRACEABLE_RAG_STATE_DIR" "$TRACEABLE_RAG_BACKUP_DIR"; do
+    marker=$owned_dir/.traceable-rag-installation
+    [ -f "$marker" ] && [ ! -L "$marker" ] || die "missing safe uninstall marker: $marker"
+    [ "$(sed -n '1p' "$marker")" = "$TRACEABLE_RAG_INSTALLATION_ID" ] || die "installation marker mismatch: $owned_dir"
+  done
+}
+
+OPERATION_LOCK_DIR=
+PENDING_OPERATION_FILE=
+SIGNAL_RECOVERY_MODE=
+SIGNAL_WAS_RUNNING=0
+SIGNAL_RECOVERY_SNAPSHOT=
+SIGNAL_RECOVERY_CONTROL=
+acquire_operation_lock() {
+  OPERATION_LOCK_DIR=$TRACEABLE_RAG_STATE_DIR/operation.lock
+  if ! mkdir "$OPERATION_LOCK_DIR" 2>/dev/null; then
+    owner=unknown
+    if [ -f "$OPERATION_LOCK_DIR/pid" ] && [ ! -L "$OPERATION_LOCK_DIR/pid" ]; then owner=$(sed -n '1p' "$OPERATION_LOCK_DIR/pid"); fi
+    marker=$(sed -n '1p' "$OPERATION_LOCK_DIR/installation-id" 2>/dev/null || true)
+    active=0
+    case "$owner" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "$owner" 2>/dev/null; then active=1; fi
+        ;;
+    esac
+    [ "$active" = 0 ] || die "another deployment-changing command holds the installation lock (pid $owner)"
+    [ -d "$OPERATION_LOCK_DIR" ] && [ ! -L "$OPERATION_LOCK_DIR" ] || die "installation lock is malformed and was not removed: $OPERATION_LOCK_DIR"
+    unexpected_lock_entry=$(find "$OPERATION_LOCK_DIR" -mindepth 1 -maxdepth 1 ! -name pid ! -name installation-id -print -quit)
+    [ -z "$unexpected_lock_entry" ] || die "installation lock contains unexpected files and was not removed: $OPERATION_LOCK_DIR"
+    [ -z "$marker" ] || [ "$marker" = "$TRACEABLE_RAG_INSTALLATION_ID" ] || die "installation lock belongs to another installation"
+    rm -f -- "$OPERATION_LOCK_DIR/pid" "$OPERATION_LOCK_DIR/installation-id"
+    rmdir "$OPERATION_LOCK_DIR" || die "could not clear stale installation lock: $OPERATION_LOCK_DIR"
+    mkdir "$OPERATION_LOCK_DIR" || die "another deployment-changing command acquired the installation lock"
+  fi
+  printf '%s\n' "$$" > "$OPERATION_LOCK_DIR/pid"
+  printf '%s\n' "$TRACEABLE_RAG_INSTALLATION_ID" > "$OPERATION_LOCK_DIR/installation-id"
+  trap 'release_operation_lock' EXIT
+  trap 'handle_operation_signal' HUP INT TERM
+}
+
+release_operation_lock() {
+  if [ -n "${OPERATION_LOCK_DIR:-}" ] && [ -d "$OPERATION_LOCK_DIR" ] && [ ! -L "$OPERATION_LOCK_DIR" ]; then
+    rm -f -- "$OPERATION_LOCK_DIR/pid" "$OPERATION_LOCK_DIR/installation-id"
+    rmdir "$OPERATION_LOCK_DIR" 2>/dev/null || true
+  fi
+  OPERATION_LOCK_DIR=
+}
+
+write_pending_operation() {
+  operation=$1
+  record=${2:-none}
+  PENDING_OPERATION_FILE=$TRACEABLE_RAG_STATE_DIR/pending-operation
+  pending_tmp=$PENDING_OPERATION_FILE.tmp.$$
+  {
+    printf 'operation=%s\n' "$operation"
+    printf 'pid=%s\n' "$$"
+    printf 'record=%s\n' "$record"
+    printf 'was_running=%s\n' "$SIGNAL_WAS_RUNNING"
+    printf 'started_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$pending_tmp"
+  chmod 600 "$pending_tmp"
+  mv "$pending_tmp" "$PENDING_OPERATION_FILE"
+}
+
+clear_pending_operation() {
+  [ -n "${PENDING_OPERATION_FILE:-}" ] || PENDING_OPERATION_FILE=$TRACEABLE_RAG_STATE_DIR/pending-operation
+  rm -f -- "$PENDING_OPERATION_FILE"
+}
+
+check_pending_operation() {
+  pending=$TRACEABLE_RAG_STATE_DIR/pending-operation
+  if [ -f "$pending" ]; then
+    operation=$(sed -n 's/^operation=//p' "$pending" | sed -n '1p')
+    owner=$(sed -n 's/^pid=//p' "$pending" | sed -n '1p')
+    die "incomplete $operation operation from pid $owner requires recovery; inspect $pending before running another command"
+  fi
+}
+
+handle_operation_signal() {
+  trap - HUP INT TERM
+  recovered=0
+  if [ "$SIGNAL_RECOVERY_MODE" = restart ]; then
+    if [ "$SIGNAL_WAS_RUNNING" = 1 ]; then compose up --detach --no-build --remove-orphans traceable-rag >/dev/null 2>&1 || recovered=1; fi
+  elif [ "$SIGNAL_RECOVERY_MODE" = restore ]; then
+    ensure_writer_stopped >/dev/null 2>&1 || recovered=1
+    if [ "$recovered" = 0 ]; then restore_snapshot_stopped "$SIGNAL_RECOVERY_SNAPSHOT" >/dev/null 2>&1 || recovered=1; fi
+    if [ "$recovered" = 0 ]; then activate_control_plane "$SIGNAL_RECOVERY_CONTROL" >/dev/null 2>&1 || recovered=1; fi
+    if [ "$recovered" = 0 ] && [ "$SIGNAL_WAS_RUNNING" = 1 ]; then compose up --detach --no-build --remove-orphans traceable-rag >/dev/null 2>&1 || recovered=1; fi
+  fi
+  if [ "$recovered" = 0 ]; then clear_pending_operation; else warn "automatic interrupt recovery failed; pending-operation was preserved"; fi
+  release_operation_lock
+  exit 130
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed"
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+  docker info >/dev/null 2>&1 || die "Docker is not running or is not accessible"
+  [ "$(docker info --format '{{.OSType}}' 2>/dev/null)" = linux ] || die "Docker must use Linux containers"
+}
+
+compose() {
+  docker compose \
+    --project-name "$TRACEABLE_RAG_PROJECT_NAME" \
+    --env-file "$ENV_FILE" \
+    --file "$COMPOSE_FILE" \
+    "$@"
+}
+
+container_location() {
+  if ! ids=$(docker ps --all --quiet \
+    --filter "label=com.docker.compose.project=$TRACEABLE_RAG_PROJECT_NAME" \
+    --filter "label=com.docker.compose.service=traceable-rag" 2>/dev/null); then
+    printf '%s' unknown
+    return
+  fi
+  ids=$(printf '%s\n' "$ids" | sed '/^$/d')
+  if [ -z "$ids" ]; then
+    printf '%s' absent
+    return
+  fi
+  case "$ids" in
+    *'
+'*) printf '%s' ambiguous; return ;;
+  esac
+  if ! printf '%s\n' "$ids" | grep -Eq '^[0-9a-f]{12,64}$'; then
+    printf '%s' unknown
+    return
+  fi
+  printf 'id:%s' "$ids"
+}
+
+container_id() {
+  location=$(container_location)
+  case "$location" in
+    id:*) printf '%s' "${location#id:}" ;;
+    absent) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+container_state() {
+  location=$(container_location)
+  case "$location" in
+    absent|ambiguous|unknown) printf '%s' "$location"; return ;;
+    id:*) id=${location#id:} ;;
+    *) printf '%s' unknown; return ;;
+  esac
+  if ! state=$(docker inspect --format '{{.State.Status}}' "$id" 2>/dev/null); then
+    printf '%s' unknown
+    return
+  fi
+  case "$state" in
+    created|restarting|running|removing|paused|exited|dead) printf '%s' "$state" ;;
+    *) printf '%s' unknown ;;
+  esac
+}
+
+is_running() {
+  [ "$(container_state)" = running ]
+}
+
+capture_writer_activity() {
+  WRITER_STATE=$(container_state)
+  case "$WRITER_STATE" in
+    running|restarting|paused) WRITER_WAS_ACTIVE=1; return 0 ;;
+    absent|created|exited|dead) WRITER_WAS_ACTIVE=0; return 0 ;;
+    *) WRITER_WAS_ACTIVE=; return 1 ;;
+  esac
+}
+
+writer_is_stopped() {
+  case "$(container_state)" in
+    absent|created|exited|dead) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_managed_restore_directory() {
+  restore_dir=$1
+  marker=$restore_dir/.traceable-rag-installation
+  [ -d "$restore_dir" ] && [ ! -L "$restore_dir" ] || return 1
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  [ "$(sed -n '1p' "$marker")" = "$TRACEABLE_RAG_INSTALLATION_ID" ]
+}
+
+ensure_writer_stopped() {
+  state=$(container_state)
+  case "$state" in
+    absent|created|exited|dead) return 0 ;;
+    running|restarting|paused) ;;
+    removing)
+      warn "container removal is still in progress; writer shutdown cannot be confirmed"
+      return 1
+      ;;
+    *)
+      warn "could not determine the Traceable RAG writer state"
+      return 1
+      ;;
+  esac
+  compose_stopped=0
+  if compose stop --timeout 45 traceable-rag; then compose_stopped=1; fi
+  if ! writer_is_stopped; then
+    location=$(container_location)
+    case "$location" in
+      absent) ;;
+      id:*)
+        id=${location#id:}
+        if ! docker stop --time 45 "$id"; then
+          warn "could not stop the uniquely identified Traceable RAG container"
+          return 1
+        fi
+        ;;
+      ambiguous)
+        warn "multiple Traceable RAG containers match the installation labels"
+        return 1
+        ;;
+      *)
+        if [ "$compose_stopped" = 0 ]; then
+          warn "Compose stop failed and the Traceable RAG container could not be uniquely identified"
+        else
+          warn "the Traceable RAG container could not be uniquely identified after Compose stop"
+        fi
+        return 1
+        ;;
+    esac
+  fi
+  state=$(container_state)
+  case "$state" in
+    absent|created|exited|dead) return 0 ;;
+    *)
+      warn "Traceable RAG writer shutdown could not be confirmed (state: $state)"
+      return 1
+      ;;
+  esac
+}
+
+base_url() {
+  case "$TRACEABLE_RAG_BIND_ADDRESS" in
+    ::1) printf 'http://[::1]:%s' "$TRACEABLE_RAG_PORT" ;;
+    *) printf 'http://%s:%s' "$TRACEABLE_RAG_BIND_ADDRESS" "$TRACEABLE_RAG_PORT" ;;
+  esac
+}
+
+http_code() {
+  path=$1
+  code=
+  if code=$(curl --silent --show-error --output /dev/null --connect-timeout 2 --max-time 5 --write-out '%{http_code}' "$(base_url)$path" 2>/dev/null); then
+    :
+  fi
+  case "$code" in
+    [0-9][0-9][0-9]) printf '%s' "$code" ;;
+    *) printf '000' ;;
+  esac
+}
+
+admin_token_is_accepted() {
+  token=$1
+  code=
+  if code=$(printf 'header = "X-Traceable-RAG-Admin-Token: %s"\n' "$token" | curl \
+    --config - \
+    --silent \
+    --show-error \
+    --output /dev/null \
+    --connect-timeout 2 \
+    --max-time 8 \
+    --request PUT \
+    --header 'Content-Type: application/json' \
+    --data '{}' \
+    --write-out '%{http_code}' \
+    "$(base_url)/api/provider-profiles/mineru" 2>/dev/null); then
+    :
+  fi
+  [ "$code" = 422 ]
+}
+
+wait_ready() {
+  attempt=0
+  while [ "$attempt" -lt "$TRACEABLE_RAG_READY_TIMEOUT_SECONDS" ]; do
+    if [ "$(http_code /readyz)" = 200 ]; then
+      return 0
+    fi
+    if [ "$(container_state)" = exited ] || [ "$(container_state)" = dead ]; then
+      compose logs --tail 100 traceable-rag >&2 || true
+      return 1
+    fi
+    if [ "$attempt" -gt 0 ] && [ $((attempt % 30)) -eq 0 ]; then
+      printf 'Waiting for readiness (%ss/%ss): livez=%s readyz=%s\n' "$attempt" "$TRACEABLE_RAG_READY_TIMEOUT_SECONDS" "$(http_code /livez)" "$(http_code /readyz)" >&2
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  compose logs --tail 100 traceable-rag >&2 || true
+  return 1
+}
+
+configured_version() {
+  printf '%s' "$TRACEABLE_RAG_RELEASE_VERSION"
+}
+
+safe_label() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+unique_snapshot_dir() {
+  label=$(safe_label "$1")
+  stamp=$(date -u '+%Y%m%dT%H%M%SZ')
+  candidate=$TRACEABLE_RAG_BACKUP_DIR/$stamp-$label
+  suffix=0
+  while [ -e "$candidate" ]; do
+    suffix=$((suffix + 1))
+    candidate=$TRACEABLE_RAG_BACKUP_DIR/$stamp-$label-$suffix
+  done
+  printf '%s' "$candidate"
+}
+
+create_snapshot_stopped() {
+  label=$1
+  writer_is_stopped || die "snapshot refused because the Traceable RAG writer is not confirmed stopped"
+  destination=$(unique_snapshot_dir "$label")
+  temporary=$destination.tmp.$$
+  mkdir -p "$TRACEABLE_RAG_BACKUP_DIR" "$temporary/data" "$temporary/config"
+  chmod 700 "$temporary"
+  if ! cp -pR "$TRACEABLE_RAG_DATA_DIR"/. "$temporary/data/"; then
+    rm -rf -- "$temporary"
+    return 1
+  fi
+  if ! cp -p "$ENV_FILE" "$temporary/config/deployment.env"; then
+    rm -rf -- "$temporary"
+    return 1
+  fi
+  {
+    printf 'created_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'image=%s\n' "$TRACEABLE_RAG_IMAGE"
+    printf 'project=%s\n' "$TRACEABLE_RAG_PROJECT_NAME"
+    printf 'data_dir=%s\n' "$TRACEABLE_RAG_DATA_DIR"
+  } > "$temporary/manifest"
+  if ! docker run --rm \
+    --user "$TRACEABLE_RAG_CONTAINER_UID:$TRACEABLE_RAG_CONTAINER_GID" \
+    --volume "$temporary:/snapshot" \
+    "$TRACEABLE_RAG_IMAGE" \
+    python -c 'import hashlib, pathlib, sqlite3, sys
+root = pathlib.Path("/snapshot")
+integrity = []
+for name in ("traceable_v3.db", "providers.db"):
+    db = root / "data" / name
+    if db.exists():
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if result != "ok":
+            print(f"{name} integrity_check failed: {result}", file=sys.stderr)
+            raise SystemExit(2)
+        integrity.append(f"{name}: ok")
+    else:
+        integrity.append(f"{name}: not present")
+(root / "integrity.txt").write_text("\n".join(integrity) + "\n", encoding="utf-8")
+def digest_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+entries = []
+for path in sorted(root.rglob("*")):
+    if not path.is_file() or path.name == "checksums.sha256":
+        continue
+    digest = digest_file(path)
+    entries.append(f"{digest}  {path.relative_to(root).as_posix()}")
+(root / "checksums.sha256").write_text("\n".join(entries) + "\n", encoding="utf-8")'; then
+    rm -rf -- "$temporary"
+    return 1
+  fi
+  mv "$temporary" "$destination"
+  LAST_SNAPSHOT=$destination
+  export LAST_SNAPSHOT
+}
+
+verify_snapshot() {
+  snapshot=$1
+  verifier_image=$(sed -n 's/^image=//p' "$snapshot/manifest" | sed -n '1p')
+  printf '%s\n' "$verifier_image" | grep -Eq '^ghcr\.io/[a-z0-9._/-]+(:v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?|@sha256:[0-9a-f]{64})$' || die "snapshot verifier image is missing or invalid: $snapshot"
+  docker run --rm \
+    --user "$TRACEABLE_RAG_CONTAINER_UID:$TRACEABLE_RAG_CONTAINER_GID" \
+    --volume "$snapshot:/snapshot:ro" \
+    "$verifier_image" \
+    python -c 'import hashlib, pathlib, sqlite3, sys
+root = pathlib.Path("/snapshot")
+manifest = root / "checksums.sha256"
+if not manifest.is_file():
+    raise SystemExit("snapshot checksum manifest is missing")
+for line in manifest.read_text(encoding="utf-8").splitlines():
+    expected, separator, relative = line.partition("  ")
+    if not separator or not relative or relative.startswith("/") or ".." in pathlib.PurePosixPath(relative).parts:
+        raise SystemExit("invalid snapshot checksum entry")
+    path = root / pathlib.PurePosixPath(relative)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        raise SystemExit(f"snapshot checksum mismatch: {relative}")
+for name in ("traceable_v3.db", "providers.db"):
+    db = root / "data" / name
+    if db.exists():
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if result != "ok":
+            raise SystemExit(f"{name} integrity_check failed: {result}")'
+}
+
+stop_for_snapshot() {
+  SNAPSHOT_WAS_RUNNING=$1
+  case "$SNAPSHOT_WAS_RUNNING" in 0|1) ;; *) die "invalid pre-snapshot writer state" ;; esac
+  ensure_writer_stopped || die "snapshot refused because the Traceable RAG writer could not be confirmed stopped"
+  export SNAPSHOT_WAS_RUNNING
+}
+
+restart_after_snapshot() {
+  if [ "${SNAPSHOT_WAS_RUNNING:-0}" = 1 ]; then
+    compose up --detach --no-build --remove-orphans traceable-rag
+    wait_ready || die "service did not recover after the snapshot"
+  fi
+}
+
+backup_command() {
+  label=${1:-manual-$(configured_version)}
+  SIGNAL_RECOVERY_MODE=restart
+  capture_writer_activity || die "backup refused because the Traceable RAG writer state is $WRITER_STATE"
+  SIGNAL_WAS_RUNNING=$WRITER_WAS_ACTIVE
+  write_pending_operation backup none
+  stop_for_snapshot "$SIGNAL_WAS_RUNNING"
+  if create_snapshot_stopped "$label"; then
+    result=$LAST_SNAPSHOT
+  else
+    restart_after_snapshot
+    clear_pending_operation
+    die "backup failed; the previous service was restarted"
+  fi
+  restart_after_snapshot
+  clear_pending_operation
+  SIGNAL_RECOVERY_MODE=
+  printf 'Backup created: %s\n' "$result"
+}
+
+set_config_value() {
+  setting=$1
+  replacement=$2
+  temporary=$ENV_FILE.tmp.$$
+  awk -v key="$setting" -v value="$replacement" '
+    BEGIN { found = 0 }
+    index($0, key "=") == 1 { print key "=" value; found = 1; next }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$ENV_FILE" > "$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$ENV_FILE"
+  export "$setting=$replacement"
+}
+
+pull_and_resolve_digest() {
+  reference=$1
+  docker pull "$reference" >&2
+  case "$reference" in
+    *@sha256:*) printf '%s' "$reference"; return ;;
+  esac
+  digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$reference" 2>/dev/null | grep -E "^${TRACEABLE_RAG_IMAGE_REPOSITORY}@sha256:[0-9a-f]{64}$" | sed -n '1p' || true)
+  [ -n "$digest" ] || die "Docker did not report an immutable RepoDigest for $reference"
+  printf '%s' "$digest"
+}
+
+sha256_file() {
+  file=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    die "sha256sum or shasum is required to verify release files"
+  fi
+}
+
+download_release_bundle() {
+  version=$1
+  command -v tar >/dev/null 2>&1 || die "tar is required to unpack a release upgrade"
+  download_root=$TRACEABLE_RAG_STATE_DIR/upgrades/.download-$version-$$
+  [ ! -e "$download_root" ] || die "release download staging path already exists: $download_root"
+  mkdir -p "$download_root/unpacked"
+  asset=traceable-rag-deployment-$version.tar.gz
+  release_base=${TRACEABLE_RAG_RELEASE_BASE_URL:-https://github.com/$TRACEABLE_RAG_RELEASE_REPOSITORY/releases/download/$version}
+  if printf '%s' "$release_base" | LC_ALL=C grep -q '[[:cntrl:]]'; then die "release base URL contains control characters"; fi
+  if [ -z "${TRACEABLE_RAG_RELEASE_BASE_URL:-}" ] && command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
+    gh release download "$version" --repo "$TRACEABLE_RAG_RELEASE_REPOSITORY" --pattern "$asset" --pattern release-manifest.json --pattern SHA256SUMS --dir "$download_root" || die "gh could not download the authenticated release assets"
+  else
+    command -v curl >/dev/null 2>&1 || die "curl is required to download a public or custom release URL"
+    curl --fail --location --silent --show-error "$release_base/$asset" --output "$download_root/$asset" || die "could not download $asset"
+    curl --fail --location --silent --show-error "$release_base/release-manifest.json" --output "$download_root/release-manifest.json" || die "could not download release-manifest.json"
+    curl --fail --location --silent --show-error "$release_base/SHA256SUMS" --output "$download_root/SHA256SUMS" || die "could not download SHA256SUMS"
+  fi
+  expected=$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1; exit }' "$download_root/SHA256SUMS")
+  [ -n "$expected" ] || die "release checksum does not list $asset"
+  [ "$(sha256_file "$download_root/$asset")" = "$expected" ] || die "deployment bundle checksum mismatch"
+  manifest_expected=$(awk '$2 == "release-manifest.json" || $2 == "*release-manifest.json" { print $1; exit }' "$download_root/SHA256SUMS")
+  [ -n "$manifest_expected" ] || die "release checksum does not list release-manifest.json"
+  [ "$(sha256_file "$download_root/release-manifest.json")" = "$manifest_expected" ] || die "release manifest checksum mismatch"
+  validate_release_manifest_file "$download_root/release-manifest.json" "$version"
+  tar -xzf "$download_root/$asset" -C "$download_root/unpacked" || die "could not unpack $asset"
+  bundle_dir=$download_root/unpacked/deploy
+  for required in compose.yaml traceable-rag release-manifest.json; do
+    [ -f "$bundle_dir/$required" ] && [ ! -L "$bundle_dir/$required" ] || die "deployment bundle is missing or redirects $required"
+  done
+  cmp -s "$download_root/release-manifest.json" "$bundle_dir/release-manifest.json" || die "deployment bundle release manifest does not match the verified release asset"
+  DOWNLOADED_RELEASE_ROOT=$download_root
+  DOWNLOADED_BUNDLE_DIR=$bundle_dir
+  DOWNLOADED_IMAGE=$RELEASE_MANIFEST_IMAGE@$RELEASE_MANIFEST_DIGEST
+  DOWNLOADED_SOURCE_COMMIT=$RELEASE_MANIFEST_SOURCE_COMMIT
+  export DOWNLOADED_RELEASE_ROOT DOWNLOADED_BUNDLE_DIR DOWNLOADED_IMAGE DOWNLOADED_SOURCE_COMMIT
+}
+
+render_env_identity() {
+  source_env=$1
+  output_env=$2
+  version=$3
+  image=$4
+  source_commit=$5
+  awk -v version="$version" -v image="$image" -v source_commit="$source_commit" '
+    BEGIN { wrote_version = wrote_image = wrote_commit = 0 }
+    index($0, "TRACEABLE_RAG_RELEASE_VERSION=") == 1 { print "TRACEABLE_RAG_RELEASE_VERSION=" version; wrote_version = 1; next }
+    index($0, "TRACEABLE_RAG_RELEASE_SOURCE_COMMIT=") == 1 { print "TRACEABLE_RAG_RELEASE_SOURCE_COMMIT=" source_commit; wrote_commit = 1; next }
+    index($0, "TRACEABLE_RAG_IMAGE=") == 1 { print "TRACEABLE_RAG_IMAGE=" image; wrote_image = 1; next }
+    { print }
+    END {
+      if (!wrote_version) print "TRACEABLE_RAG_RELEASE_VERSION=" version
+      if (!wrote_commit) print "TRACEABLE_RAG_RELEASE_SOURCE_COMMIT=" source_commit
+      if (!wrote_image) print "TRACEABLE_RAG_IMAGE=" image
+    }
+  ' "$source_env" > "$output_env"
+  chmod 600 "$output_env"
+}
+
+render_release_compose() {
+  template=$1
+  output=$2
+  sed \
+    -e "s/@TRACEABLE_RAG_CONTAINER_UID@/$TRACEABLE_RAG_CONTAINER_UID/g" \
+    -e "s/@TRACEABLE_RAG_CONTAINER_GID@/$TRACEABLE_RAG_CONTAINER_GID/g" \
+    "$template" > "$output"
+  grep -Fq "user: \"$TRACEABLE_RAG_CONTAINER_UID:$TRACEABLE_RAG_CONTAINER_GID\"" "$output" || die "could not render the release Compose user"
+  chmod 600 "$output"
+}
+
+activate_control_plane() {
+  control_dir=$1
+  for required in traceable-rag compose.yaml deployment.env; do
+    [ -f "$control_dir/$required" ] && [ ! -L "$control_dir/$required" ] || die "upgrade control plane is missing $required"
+  done
+  manager_tmp=$CONFIG_DIR/traceable-rag.activate.$$
+  compose_tmp=$CONFIG_DIR/compose.yaml.activate.$$
+  env_tmp=$CONFIG_DIR/deployment.env.activate.$$
+  cp "$control_dir/traceable-rag" "$manager_tmp"
+  cp "$control_dir/compose.yaml" "$compose_tmp"
+  cp "$control_dir/deployment.env" "$env_tmp"
+  chmod 700 "$manager_tmp"
+  chmod 600 "$compose_tmp" "$env_tmp"
+  if [ -f "$control_dir/release-manifest.json" ]; then
+    manifest_tmp=$CONFIG_DIR/release-manifest.json.activate.$$
+    cp "$control_dir/release-manifest.json" "$manifest_tmp"
+    chmod 600 "$manifest_tmp"
+    mv "$manifest_tmp" "$RELEASE_MANIFEST_FILE"
+  else
+    rm -f "$RELEASE_MANIFEST_FILE"
+  fi
+  mv "$manager_tmp" "$CONFIG_DIR/traceable-rag"
+  mv "$compose_tmp" "$COMPOSE_FILE"
+  mv "$env_tmp" "$ENV_FILE"
+  load_config
+  validate_config
+}
+
+restore_snapshot_stopped() {
+  snapshot=$1
+  if ! writer_is_stopped; then
+    warn "snapshot restore refused because the Traceable RAG writer is not confirmed stopped"
+    return 1
+  fi
+  [ -d "$snapshot/data" ] || die "snapshot data is missing: $snapshot"
+  [ -f "$snapshot/checksums.sha256" ] || die "snapshot checksum manifest is missing: $snapshot"
+  is_managed_restore_directory "$snapshot/data" || die "snapshot data does not belong to this Traceable RAG installation"
+  verify_snapshot "$snapshot" || die "snapshot verification failed: $snapshot"
+  parent=$(dirname "$TRACEABLE_RAG_DATA_DIR")
+  base=$(basename "$TRACEABLE_RAG_DATA_DIR")
+  if [ ! -e "$TRACEABLE_RAG_DATA_DIR" ]; then
+    displaced_count=0
+    displaced_recovery=
+    for candidate in "$parent"/."$base".displaced.*; do
+      [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+      is_managed_restore_directory "$candidate" || die "unsafe or unmanaged interrupted restore data directory: $candidate"
+      displaced_count=$((displaced_count + 1))
+      displaced_recovery=$candidate
+    done
+    [ "$displaced_count" = 1 ] || die "data directory is missing and interrupted restore state is ambiguous under $parent"
+    for orphan_stage in "$parent"/."$base".restore.*; do
+      [ -e "$orphan_stage" ] || [ -L "$orphan_stage" ] || continue
+      is_managed_restore_directory "$orphan_stage" || die "unsafe or unmanaged interrupted restore staging directory: $orphan_stage"
+    done
+    mv "$displaced_recovery" "$TRACEABLE_RAG_DATA_DIR" || die "could not recover the displaced data directory"
+    for orphan_stage in "$parent"/."$base".restore.*; do
+      [ -e "$orphan_stage" ] || [ -L "$orphan_stage" ] || continue
+      is_managed_restore_directory "$orphan_stage" || die "interrupted restore staging directory changed during recovery: $orphan_stage"
+      rm -rf -- "$orphan_stage"
+    done
+  fi
+  stage=$parent/.$base.restore.$$
+  displaced=$parent/.$base.displaced.$$
+  [ ! -e "$stage" ] || die "restore staging path already exists: $stage"
+  [ ! -e "$displaced" ] || die "restore staging path already exists: $displaced"
+  mkdir -p "$stage"
+  if ! cp -pR "$snapshot/data"/. "$stage/"; then
+    rm -rf -- "$stage"
+    die "could not stage snapshot data"
+  fi
+  if ! is_managed_restore_directory "$stage"; then
+    rm -rf -- "$stage"
+    die "snapshot data does not belong to this Traceable RAG installation"
+  fi
+  mv "$TRACEABLE_RAG_DATA_DIR" "$displaced"
+  if mv "$stage" "$TRACEABLE_RAG_DATA_DIR"; then
+    rm -rf -- "$displaced"
+  else
+    mv "$displaced" "$TRACEABLE_RAG_DATA_DIR" || true
+    rm -rf -- "$stage"
+    die "could not activate snapshot data"
+  fi
+}
+
+prepare_upgrade_record() {
+  new_version=$1
+  new_image=$2
+  new_source_commit=$3
+  snapshot=$4
+  bundle_dir=$5
+  record=$TRACEABLE_RAG_STATE_DIR/upgrades/$(date -u '+%Y%m%dT%H%M%SZ')-$(safe_label "$new_version")
+  suffix=0
+  while [ -e "$record" ]; do suffix=$((suffix + 1)); record=$TRACEABLE_RAG_STATE_DIR/upgrades/$(date -u '+%Y%m%dT%H%M%SZ')-$(safe_label "$new_version")-$suffix; done
+  previous_control=$record/control/previous
+  target_control=$record/control/target
+  mkdir -p "$previous_control" "$target_control"
+  cp "$CONFIG_DIR/traceable-rag" "$previous_control/traceable-rag"
+  cp "$COMPOSE_FILE" "$previous_control/compose.yaml"
+  cp "$ENV_FILE" "$previous_control/deployment.env"
+  if [ -f "$RELEASE_MANIFEST_FILE" ]; then cp "$RELEASE_MANIFEST_FILE" "$previous_control/release-manifest.json"; fi
+  cp "$bundle_dir/traceable-rag" "$target_control/traceable-rag"
+  sh -n "$target_control/traceable-rag" || die "target release manager has invalid shell syntax"
+  render_release_compose "$bundle_dir/compose.yaml" "$target_control/compose.yaml"
+  cp "$bundle_dir/release-manifest.json" "$target_control/release-manifest.json"
+  render_env_identity "$ENV_FILE" "$target_control/deployment.env" "$new_version" "$new_image" "$new_source_commit"
+  chmod 700 "$previous_control/traceable-rag" "$target_control/traceable-rag"
+  chmod 600 "$previous_control/compose.yaml" "$previous_control/deployment.env" "$target_control/compose.yaml" "$target_control/deployment.env" "$target_control/release-manifest.json"
+  if [ -f "$previous_control/release-manifest.json" ]; then chmod 600 "$previous_control/release-manifest.json"; fi
+  printf '%s\n' "$TRACEABLE_RAG_IMAGE" > "$record/previous-image"
+  printf '%s\n' "$TRACEABLE_RAG_RELEASE_VERSION" > "$record/previous-release"
+  printf '%s\n' "${TRACEABLE_RAG_RELEASE_SOURCE_COMMIT:-}" > "$record/previous-source-commit"
+  printf '%s\n' "$new_image" > "$record/target-image"
+  printf '%s\n' "$new_version" > "$record/target-release"
+  printf '%s\n' "$new_source_commit" > "$record/target-source-commit"
+  printf '%s\n' "$snapshot" > "$record/pre-upgrade-snapshot"
+  LAST_UPGRADE_RECORD=$record
+  export LAST_UPGRADE_RECORD
+}
+
+normalize_version() {
+  version=$1
+  case "$version" in
+    v*) ;;
+    *) version=v$version ;;
+  esac
+  grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$' <<EOF || die "version must be an exact release such as v0.4.2"
+$version
+EOF
+  printf '%s' "$version"
+}
+
+upgrade_command() {
+  [ "$#" -eq 1 ] || die "usage: traceable-rag upgrade <vX.Y.Z>"
+  version=$(normalize_version "$1")
+  previous=$TRACEABLE_RAG_IMAGE
+  previous_version=$TRACEABLE_RAG_RELEASE_VERSION
+  if [ "$version" = "$previous_version" ]; then
+    printf 'Already configured for %s\n' "$version"
+    return
+  fi
+
+  printf 'Downloading and verifying the %s release control plane...\n' "$version"
+  download_release_bundle "$version"
+  target=$DOWNLOADED_IMAGE
+  target_source_commit=$DOWNLOADED_SOURCE_COMMIT
+  printf 'Pulling immutable image %s before stopping the current service...\n' "$target"
+  docker pull "$target" >&2 || { rm -rf -- "$DOWNLOADED_RELEASE_ROOT"; die "could not pull $target"; }
+  prepare_upgrade_record "$version" "$target" "$target_source_commit" pending "$DOWNLOADED_BUNDLE_DIR"
+  SIGNAL_RECOVERY_MODE=restart
+  if ! capture_writer_activity; then
+    rm -rf -- "$DOWNLOADED_RELEASE_ROOT" "$LAST_UPGRADE_RECORD"
+    die "upgrade refused because the Traceable RAG writer state is $WRITER_STATE"
+  fi
+  SIGNAL_WAS_RUNNING=$WRITER_WAS_ACTIVE
+  write_pending_operation upgrade "$LAST_UPGRADE_RECORD"
+  stop_for_snapshot "$SIGNAL_WAS_RUNNING"
+  if ! create_snapshot_stopped "pre-upgrade-$(configured_version)-to-$version"; then
+    restart_after_snapshot
+    clear_pending_operation
+    rm -rf -- "$DOWNLOADED_RELEASE_ROOT"
+    rm -rf -- "$LAST_UPGRADE_RECORD"
+    die "upgrade aborted because the pre-upgrade backup failed"
+  fi
+  snapshot=$LAST_SNAPSHOT
+  printf '%s\n' "$snapshot" > "$LAST_UPGRADE_RECORD/pre-upgrade-snapshot"
+  SIGNAL_RECOVERY_MODE=restore
+  SIGNAL_RECOVERY_SNAPSHOT=$snapshot
+  SIGNAL_RECOVERY_CONTROL=$LAST_UPGRADE_RECORD/control/previous
+  if ! (activate_control_plane "$LAST_UPGRADE_RECORD/control/target"); then
+    warn "target control plane could not be activated; restoring the previous release"
+    restore_snapshot_stopped "$snapshot"
+    activate_control_plane "$LAST_UPGRADE_RECORD/control/previous"
+    restart_after_snapshot
+    clear_pending_operation
+    rm -rf -- "$DOWNLOADED_RELEASE_ROOT"
+    die "upgrade failed before the target service started; previous release was restored"
+  fi
+  load_config
+  validate_config
+  rm -rf -- "$DOWNLOADED_RELEASE_ROOT"
+
+  if compose up --detach --no-build --remove-orphans traceable-rag && wait_ready; then
+    printf '%s\n' "$LAST_UPGRADE_RECORD" > "$TRACEABLE_RAG_STATE_DIR/last-upgrade"
+    clear_pending_operation
+    SIGNAL_RECOVERY_MODE=
+    printf 'Upgraded to %s (%s). Pre-upgrade backup: %s\n' "$version" "$target" "$snapshot"
+    return
+  fi
+
+  warn "new release failed readiness; restoring the previous image and data"
+  ensure_writer_stopped || die "automatic recovery refused because the target writer could not be confirmed stopped; pending-operation was preserved"
+  restore_snapshot_stopped "$snapshot"
+  activate_control_plane "$LAST_UPGRADE_RECORD/control/previous"
+  compose up --detach --no-build --remove-orphans traceable-rag
+  wait_ready || die "automatic recovery also failed; inspect logs and backup $snapshot"
+  clear_pending_operation
+  SIGNAL_RECOVERY_MODE=
+  die "upgrade failed; previous release was restored"
+}
+
+rollback_command() {
+  pointer=$TRACEABLE_RAG_STATE_DIR/last-upgrade
+  [ -f "$pointer" ] || die "no successful upgrade record is available"
+  record=$(sed -n '1p' "$pointer")
+  [ -d "$record" ] || die "upgrade record is missing: $record"
+  previous=$(sed -n '1p' "$record/previous-image")
+  previous_version=$(sed -n '1p' "$record/previous-release")
+  target=$(sed -n '1p' "$record/target-image")
+  target_version=$(sed -n '1p' "$record/target-release")
+  upgrade_snapshot=$(sed -n '1p' "$record/pre-upgrade-snapshot")
+  [ "$TRACEABLE_RAG_IMAGE" = "$target" ] || die "current image no longer matches the last upgrade target; refusing an ambiguous rollback"
+  grep -Eq '^ghcr\.io/[a-z0-9._/-]+(:v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?|@sha256:[0-9a-f]{64})$' <<EOF || die "recorded rollback image is invalid"
+$previous
+EOF
+
+  [ -d "$record/control/previous" ] && [ -d "$record/control/target" ] || die "upgrade record has no restorable control plane"
+  docker pull "$previous"
+  SIGNAL_RECOVERY_MODE=restart
+  capture_writer_activity || die "rollback refused because the Traceable RAG writer state is $WRITER_STATE"
+  SIGNAL_WAS_RUNNING=$WRITER_WAS_ACTIVE
+  write_pending_operation rollback "$record"
+  stop_for_snapshot "$SIGNAL_WAS_RUNNING"
+  if ! create_snapshot_stopped "pre-rollback-$(configured_version)"; then
+    restart_after_snapshot
+    clear_pending_operation
+    die "rollback aborted because the safety backup failed"
+  fi
+  safety=$LAST_SNAPSHOT
+  printf '%s\n' "$safety" > "$record/pre-rollback-snapshot"
+  SIGNAL_RECOVERY_MODE=restore
+  SIGNAL_RECOVERY_SNAPSHOT=$safety
+  SIGNAL_RECOVERY_CONTROL=$record/control/target
+  restore_snapshot_stopped "$upgrade_snapshot"
+  if ! (activate_control_plane "$record/control/previous"); then
+    warn "rollback control plane could not be activated; restoring the pre-rollback state"
+    restore_snapshot_stopped "$safety"
+    activate_control_plane "$record/control/target"
+    restart_after_snapshot
+    clear_pending_operation
+    die "rollback failed before the previous service started; target release was restored"
+  fi
+  load_config
+  validate_config
+
+  if compose up --detach --no-build --remove-orphans traceable-rag && wait_ready; then
+    printf '%s\n' "$record" > "$TRACEABLE_RAG_STATE_DIR/last-rollback"
+    rm -f "$pointer"
+    clear_pending_operation
+    SIGNAL_RECOVERY_MODE=
+    printf 'Rolled back to %s (%s). Safety backup: %s\n' "$previous_version" "$previous" "$safety"
+    return
+  fi
+
+  warn "rollback target failed readiness; restoring the pre-rollback state"
+  ensure_writer_stopped || die "rollback recovery refused because the writer could not be confirmed stopped; pending-operation was preserved"
+  restore_snapshot_stopped "$safety"
+  activate_control_plane "$record/control/target"
+  compose up --detach --no-build --remove-orphans traceable-rag
+  wait_ready || die "rollback recovery failed; inspect backups $upgrade_snapshot and $safety"
+  clear_pending_operation
+  SIGNAL_RECOVERY_MODE=
+  die "rollback failed; the pre-rollback state was restored"
+}
+
+recover_command() {
+  pending=$TRACEABLE_RAG_STATE_DIR/pending-operation
+  [ -f "$pending" ] || { printf 'No interrupted deployment operation was found.\n'; return; }
+  operation=$(sed -n 's/^operation=//p' "$pending" | sed -n '1p')
+  record=$(sed -n 's/^record=//p' "$pending" | sed -n '1p')
+  was_running=$(sed -n 's/^was_running=//p' "$pending" | sed -n '1p')
+  case "$was_running" in 0|1) ;; *) die "pending operation has invalid running state" ;; esac
+  ensure_writer_stopped || die "recovery refused because the Traceable RAG writer could not be confirmed stopped; pending-operation was preserved"
+  case "$operation" in
+    backup)
+      ;;
+    upgrade)
+      [ -d "$record/control/previous" ] || die "pending upgrade has no previous control plane: $record"
+      snapshot=$(sed -n '1p' "$record/pre-upgrade-snapshot" 2>/dev/null || true)
+      if [ -n "$snapshot" ] && [ "$snapshot" != pending ] && [ -d "$snapshot" ]; then restore_snapshot_stopped "$snapshot"; fi
+      activate_control_plane "$record/control/previous"
+      ;;
+    rollback)
+      [ -d "$record/control/target" ] || die "pending rollback has no target control plane: $record"
+      safety=$(sed -n '1p' "$record/pre-rollback-snapshot" 2>/dev/null || true)
+      if [ -n "$safety" ] && [ -d "$safety" ]; then restore_snapshot_stopped "$safety"; fi
+      activate_control_plane "$record/control/target"
+      ;;
+    *) die "pending operation type is invalid: $operation" ;;
+  esac
+  load_config
+  validate_config
+  if [ "$was_running" = 1 ]; then
+    compose up --detach --no-build --remove-orphans traceable-rag
+    wait_ready || die "recovery restored the prior control plane, but the service did not become ready"
+  fi
+  clear_pending_operation
+  printf 'Recovered interrupted %s operation to the last known-good side.\n' "$operation"
+}
+
+codex_skill_target() {
+  codex_home=${CODEX_HOME:-$HOME/.codex}
+  printf '%s/skills/traceable-rag' "$codex_home"
+}
+
+agent_install_codex() {
+  knowledge_base_id=
+  adopt_existing=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --knowledge-base-id)
+        [ "$#" -ge 2 ] || die "--knowledge-base-id requires a value"
+        knowledge_base_id=$2
+        shift
+        ;;
+      --adopt-existing) adopt_existing=1 ;;
+      *) die "unknown agent install-codex option: $1" ;;
+    esac
+    shift
+  done
+  printf '%s\n' "$knowledge_base_id" | grep -Eq '^[A-Za-z0-9._-]{0,128}$' || die "knowledge base ID may contain only letters, digits, dot, underscore and hyphen"
+  is_running || die "start Traceable RAG before installing the Codex Skill"
+  id=$(container_id)
+  [ -n "$id" ] || die "running container could not be resolved"
+  target=$(codex_skill_target)
+  skill_marker=$target/.traceable-rag-installation
+  existing_runtime=$target/references/runtime.md
+  for guarded in "$target" "$target/agents" "$target/references" "$target/SKILL.md" "$target/agents/openai.yaml" "$target/references/http-contract.md" "$existing_runtime" "$skill_marker"; do
+    [ ! -L "$guarded" ] || die "refusing Codex Skill path redirected by a symbolic link: $guarded"
+  done
+  [ ! -e "$target" ] || [ -d "$target" ] || die "Codex Skill target is not a directory: $target"
+  [ ! -e "$target/agents" ] || [ -d "$target/agents" ] || die "Codex Skill agents path is not a directory"
+  [ ! -e "$target/references" ] || [ -d "$target/references" ] || die "Codex Skill references path is not a directory"
+  if [ -d "$target" ] && [ -n "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    if ! { [ -f "$skill_marker" ] && [ ! -L "$skill_marker" ] && [ "$(sed -n '1p' "$skill_marker")" = "$TRACEABLE_RAG_INSTALLATION_ID" ]; }; then
+      [ "$adopt_existing" = 1 ] || die "refusing to overwrite an unmanaged Codex Skill: $target; rerun with agent install-codex --adopt-existing after reviewing it"
+      skill_backup=$target.backup.$(date -u '+%Y%m%dT%H%M%SZ')
+      [ ! -e "$skill_backup" ] || die "Codex Skill adoption backup already exists: $skill_backup"
+      cp -pR "$target" "$skill_backup" || die "could not back up the existing Codex Skill"
+      printf 'Existing Codex Skill backed up to %s\n' "$skill_backup"
+    fi
+  fi
+  if [ -z "$knowledge_base_id" ] && [ -f "$existing_runtime" ]; then
+    knowledge_base_id=$(sed -n 's/^knowledge_base_id:[[:space:]]*//p' "$existing_runtime" | sed -n '1p')
+  fi
+  knowledge_base_id=${knowledge_base_id:-default}
+  printf '%s\n' "$knowledge_base_id" | grep -Eq '^[A-Za-z0-9._-]{1,128}$' || die "existing knowledge base ID is unsafe for runtime.md"
+  temporary=$(mktemp -d "${TMPDIR:-/tmp}/traceable-rag-skill.XXXXXX")
+  mkdir -p "$temporary/template"
+  docker cp "$id:/app/integrations/codex-skill/traceable-rag/." "$temporary/template/"
+  for required in SKILL.md agents/openai.yaml references/http-contract.md; do
+    [ -f "$temporary/template/$required" ] || die "image is missing Codex Skill file: $required"
+  done
+  mkdir -p "$target/agents" "$target/references"
+  cp -p "$temporary/template/SKILL.md" "$target/SKILL.md"
+  cp -p "$temporary/template/agents/openai.yaml" "$target/agents/openai.yaml"
+  cp -p "$temporary/template/references/http-contract.md" "$target/references/http-contract.md"
+  runtime_tmp=$target/references/runtime.md.tmp.$$
+  {
+    printf '# Runtime configuration\n\n'
+    printf 'base_url: %s\n' "$(base_url)"
+    printf 'knowledge_base_id: %s\n' "$knowledge_base_id"
+  } > "$runtime_tmp"
+  chmod 600 "$runtime_tmp"
+  mv "$runtime_tmp" "$target/references/runtime.md"
+  printf '%s' "$TRACEABLE_RAG_INSTALLATION_ID" > "$skill_marker"
+  chmod 600 "$skill_marker"
+  rm -rf -- "$temporary"
+  printf 'Codex Skill installed at %s\n' "$target"
+  printf 'Runtime: base_url=%s knowledge_base_id=%s\n' "$(base_url)" "$knowledge_base_id"
+}
+
+agent_doctor_codex() {
+  target=$(codex_skill_target)
+  missing=0
+  for required in SKILL.md agents/openai.yaml references/http-contract.md references/runtime.md; do
+    if [ ! -f "$target/$required" ]; then
+      warn "missing Codex Skill file: $target/$required"
+      missing=1
+    fi
+  done
+  [ "$missing" = 0 ] || return 1
+  installed_url=$(sed -n 's/^base_url:[[:space:]]*//p' "$target/references/runtime.md" | sed -n '1p')
+  installed_kb=$(sed -n 's/^knowledge_base_id:[[:space:]]*//p' "$target/references/runtime.md" | sed -n '1p')
+  [ "$installed_url" = "$(base_url)" ] || die "Codex Skill base_url is $installed_url, expected $(base_url)"
+  [ -n "$installed_kb" ] || die "Codex Skill has no default knowledge_base_id"
+  ready=$(http_code /readyz)
+  [ "$ready" = 200 ] || die "Traceable RAG readiness endpoint returned HTTP $ready"
+  contract_tmp=$(mktemp "${TMPDIR:-/tmp}/traceable-rag-openapi.XXXXXX")
+  curl --fail --silent --show-error --connect-timeout 2 --max-time 15 "$(base_url)/openapi.json" > "$contract_tmp" || die "could not read the OpenAPI contract"
+  for marker in '/api/retrieval' 'pipeline_used' 'source_url' '/api/sources/{source_id}/context'; do
+    grep -Fq "$marker" "$contract_tmp" || die "OpenAPI is missing required Agent contract marker: $marker"
+  done
+  rm -f -- "$contract_tmp"
+  printf 'Codex Skill: ok\n'
+  printf '  target: %s\n' "$target"
+  printf '  base_url: %s\n' "$installed_url"
+  printf '  knowledge_base_id: %s\n' "$installed_kb"
+  printf '  retrieval/source contract: ok\n'
+}
+
+agent_command() {
+  subcommand=${1:-}
+  [ -n "$subcommand" ] || die "usage: traceable-rag agent <install-codex|doctor-codex>"
+  shift
+  case "$subcommand" in
+    install-codex) agent_install_codex "$@" ;;
+    doctor-codex)
+      [ "$#" -eq 0 ] || die "agent doctor-codex does not accept arguments"
+      agent_doctor_codex
+      ;;
+    *) die "unknown agent command: $subcommand" ;;
+  esac
+}
+
+admin_rotate_token() {
+  capture_writer_activity || die "admin token rotation refused because the Traceable RAG writer state is $WRITER_STATE"
+  rotate_requires_recreate=$WRITER_WAS_ACTIVE
+  token_tmp=$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE.tmp.$$
+  token_previous=$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE.previous.$$
+  [ ! -e "$token_tmp" ] && [ ! -e "$token_previous" ] || die "admin token rotation staging path already exists"
+  dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -v -tx1 | tr -d ' \n' > "$token_tmp"
+  [ "$(wc -c < "$token_tmp" | tr -d ' ')" = 64 ] || die "could not generate a replacement admin token"
+  grep -Eq '^[0-9a-f]{64}$' "$token_tmp" || die "replacement admin token is malformed"
+  chmod 600 "$token_tmp"
+  cp -p "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE" "$token_previous" || die "could not stage the previous admin token"
+  mv "$token_tmp" "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE"
+  if [ "$rotate_requires_recreate" = 1 ]; then
+    new_token=$(sed -n '1p' "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE")
+    if compose up --detach --force-recreate --no-build --remove-orphans traceable-rag && wait_ready && admin_token_is_accepted "$new_token"; then
+      rm -f -- "$token_previous"
+    else
+      warn "admin token rotation failed; restoring the previous token and service"
+      mv "$token_previous" "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE" || die "admin token rotation failed and the previous token could not be restored"
+      previous_token=$(sed -n '1p' "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE")
+      if compose up --detach --force-recreate --no-build --remove-orphans traceable-rag && wait_ready && admin_token_is_accepted "$previous_token"; then
+        die "admin token rotation failed; the previous token and service were restored"
+      fi
+      die "admin token rotation failed; the previous token was restored on disk but service recovery also failed"
+    fi
+  else
+    rm -f -- "$token_previous"
+  fi
+  printf 'Admin token rotated. Previous setup links are invalid.\n'
+  show_setup_url || true
+}
+
+admin_command() {
+  subcommand=${1:-}
+  shift || true
+  case "$subcommand" in
+    rotate-token)
+      [ "$#" -eq 0 ] || die "admin rotate-token does not accept arguments"
+      admin_rotate_token
+      ;;
+    *) die "usage: traceable-rag admin rotate-token" ;;
+  esac
+}
+
+show_setup_url() {
+  token=$(sed -n '1p' "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE")
+  [ -n "$token" ] || die "admin token is empty"
+  if ! (printf 'Admin configuration URL: %s/setup#token=%s\n' "$(base_url)" "$token" > /dev/tty) 2>/dev/null; then
+    warn "setup URL is only shown on an interactive terminal; rerun traceable-rag setup-url locally"
+    return 1
+  fi
+}
+
+json_escape() {
+  awk 'BEGIN { ORS="" }
+    {
+      gsub(/\\/, "\\\\");
+      gsub(/\"/, "\\\"");
+      gsub(/\r/, "\\r");
+      if (NR > 1) printf "\\n";
+      printf "%s", $0
+    }'
+}
+
+safe_get_json() {
+  path=$1
+  token=$(sed -n '1p' "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE")
+  printf 'header = "X-Traceable-RAG-Admin-Token: %s"\n' "$token" | \
+    curl --config - --fail --silent --show-error --connect-timeout 2 --max-time 8 \
+      "$(base_url)$path" 2>/dev/null || printf 'null'
+}
+
+safe_post_json() {
+  path=$1
+  payload=$2
+  token=$(sed -n '1p' "$TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE")
+  printf 'header = "X-Traceable-RAG-Admin-Token: %s"\n' "$token" | \
+    curl --config - --fail --silent --show-error --connect-timeout 3 --max-time 45 \
+      --header 'Content-Type: application/json' \
+      --data "$payload" \
+      "$(base_url)$path" 2>/dev/null || printf 'null'
+}
+
+doctor_command() {
+  json=0
+  test_roles=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      --test-provider)
+        [ "$#" -ge 2 ] || die "--test-provider requires one of mineru, embedding, reranker or llm"
+        case "$2" in
+          mineru|embedding|reranker|llm) test_roles="$test_roles $2" ;;
+          *) die "unsupported Provider role: $2" ;;
+        esac
+        shift
+        ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+    shift
+  done
+
+  docker_ok=true
+  compose_ok=true
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    docker_ok=false
+  fi
+  if [ "$docker_ok" = false ] || ! docker compose version >/dev/null 2>&1; then
+    compose_ok=false
+  fi
+  state=unavailable
+  if [ "$docker_ok" = true ] && [ "$compose_ok" = true ]; then
+    state=$(container_state)
+  fi
+  live_code=$(http_code /livez)
+  ready_code=$(http_code /readyz)
+  legacy_health_code=$(http_code /api/health)
+  provider_summary=$(safe_get_json /api/provider-profiles)
+  provider_tests=null
+  roles_json='[]'
+  if [ -n "$test_roles" ]; then
+    provider_tests='{'
+    roles_json='['
+    separator=
+    for role in $test_roles; do
+      result=$(safe_post_json "/api/provider-profiles/$role/test" '{}')
+      provider_tests=$provider_tests$separator\"$role\":$result
+      roles_json=$roles_json$separator\"$role\"
+      separator=,
+    done
+    provider_tests=$provider_tests'}'
+    roles_json=$roles_json']'
+  fi
+  skill="traceable-rag agent install-codex --knowledge-base-id default"
+  loopback=true
+  case "$TRACEABLE_RAG_BIND_ADDRESS" in
+    127.0.0.1|localhost|::1) ;;
+    *) loopback=false ;;
+  esac
+
+  if [ "$json" = 1 ]; then
+    config_escaped=$(printf '%s' "$CONFIG_DIR" | json_escape)
+    data_escaped=$(printf '%s' "$TRACEABLE_RAG_DATA_DIR" | json_escape)
+    image_escaped=$(printf '%s' "$TRACEABLE_RAG_IMAGE" | json_escape)
+    version_escaped=$(configured_version | json_escape)
+    project_escaped=$(printf '%s' "$TRACEABLE_RAG_PROJECT_NAME" | json_escape)
+    state_escaped=$(printf '%s' "$state" | json_escape)
+    skill_escaped=$(printf '%s' "$skill" | json_escape)
+    printf '{'
+    printf '"installation":{"ok":true,"config_dir":"%s","data_dir":"%s","project":"%s","loopback":%s},' "$config_escaped" "$data_escaped" "$project_escaped" "$loopback"
+    printf '"version":{"configured":"%s","image":"%s"},' "$version_escaped" "$image_escaped"
+    printf '"container":{"state":"%s","docker_ok":%s,"compose_ok":%s},' "$state_escaped" "$docker_ok" "$compose_ok"
+    printf '"livez":{"ok":%s,"http_status":"%s"},' "$( [ "$live_code" = 200 ] && printf true || printf false )" "$live_code"
+    printf '"readyz":{"ok":%s,"http_status":"%s","legacy_health_status":"%s"},' "$( [ "$ready_code" = 200 ] && printf true || printf false )" "$ready_code" "$legacy_health_code"
+    printf '"provider_summary":%s,' "$provider_summary"
+    printf '"provider_tests":{"requested_roles":%s,"results":%s},' "$roles_json" "$provider_tests"
+    printf '"skill":{"command":"%s"}' "$skill_escaped"
+    printf '}\n'
+  else
+    printf 'Installation: ok\n'
+    printf '  config: %s\n' "$CONFIG_DIR"
+    printf '  data: %s\n' "$TRACEABLE_RAG_DATA_DIR"
+    printf '  project: %s\n' "$TRACEABLE_RAG_PROJECT_NAME"
+    printf '  image: %s\n' "$TRACEABLE_RAG_IMAGE"
+    printf 'Container: %s (Docker: %s, Compose: %s)\n' "$state" "$docker_ok" "$compose_ok"
+    printf 'Live: HTTP %s; Ready: HTTP %s; legacy health: HTTP %s\n' "$live_code" "$ready_code" "$legacy_health_code"
+    printf 'Provider profiles (read-only, no external call): %s\n' "$provider_summary"
+    if [ -n "$test_roles" ]; then
+      printf 'Explicit Provider tests: %s\n' "$provider_tests"
+    fi
+    printf 'Codex Skill command: %s\n' "$skill"
+    if [ "$loopback" = false ]; then
+      warn "service is not bound to loopback; add authentication and TLS before remote exposure"
+    fi
+  fi
+
+  [ "$docker_ok" = true ] && [ "$compose_ok" = true ] || return 1
+  [ "$live_code" = 200 ] && [ "$ready_code" = 200 ] || return 1
+}
+
+uninstall_command() {
+  purge=0
+  confirmed=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1 ;;
+      --yes) confirmed=1 ;;
+      *) die "unknown uninstall option: $1" ;;
+    esac
+    shift
+  done
+  if [ "$purge" = 1 ]; then
+    [ "$confirmed" = 1 ] || die "purge is destructive; repeat with uninstall --purge --yes"
+    verify_installation_markers
+    for purge_path in "$CONFIG_DIR" "$TRACEABLE_RAG_DATA_DIR" "$TRACEABLE_RAG_STATE_DIR" "$TRACEABLE_RAG_BACKUP_DIR"; do
+      [ "$purge_path" != / ] && [ "$purge_path" != "$HOME" ] || die "refusing unsafe purge path: $purge_path"
+    done
+  fi
+
+  compose down --remove-orphans || die "could not remove the container and network; no files were deleted"
+
+  if [ "$purge" = 1 ]; then
+    rm -rf -- "$TRACEABLE_RAG_DATA_DIR" "$TRACEABLE_RAG_BACKUP_DIR" "$TRACEABLE_RAG_STATE_DIR" "$CONFIG_DIR" || die "purge did not complete; the command entry was preserved"
+  fi
+  if [ -n "${TRACEABLE_RAG_BIN_LINK:-}" ] && [ -L "$TRACEABLE_RAG_BIN_LINK" ] && [ "$(readlink "$TRACEABLE_RAG_BIN_LINK")" = "$CONFIG_DIR/traceable-rag" ]; then
+    rm -f "$TRACEABLE_RAG_BIN_LINK"
+  elif [ -n "${TRACEABLE_RAG_BIN_LINK:-}" ] && [ -e "$TRACEABLE_RAG_BIN_LINK" -o -L "$TRACEABLE_RAG_BIN_LINK" ]; then
+    warn "command entry no longer matches this installation and was preserved: $TRACEABLE_RAG_BIN_LINK"
+  fi
+  if [ "$purge" = 0 ]; then
+    printf 'Runtime removed. Data, configuration and backups were preserved.\n'
+    printf 'Reinstall to restore the command, or use uninstall --purge --yes to delete them.\n'
+  else
+    printf 'Runtime, data, configuration and backups were deleted.\n'
+  fi
+}
+
+load_config
+command_name=$1
+shift
+
+if [ -f "$TRACEABLE_RAG_STATE_DIR/pending-operation" ]; then
+  case "$command_name" in
+    recover|status|doctor|logs|setup-url) warn "an interrupted deployment operation is pending; run traceable-rag recover before making changes" ;;
+    *) check_pending_operation ;;
+  esac
+else
+  validate_config
+fi
+
+case "$command_name" in
+  start)
+    [ "$#" -eq 0 ] || die "start does not accept arguments"
+    acquire_operation_lock
+    require_docker
+    resolved_image=$(pull_and_resolve_digest "$TRACEABLE_RAG_IMAGE")
+    if [ "$resolved_image" != "$TRACEABLE_RAG_IMAGE" ]; then
+      set_config_value TRACEABLE_RAG_IMAGE "$resolved_image"
+    fi
+    compose config --quiet
+    compose up --detach --no-build --remove-orphans traceable-rag
+    wait_ready || die "service did not become ready"
+    printf 'Traceable RAG is ready at %s\n' "$(base_url)"
+    ;;
+  stop)
+    [ "$#" -eq 0 ] || die "stop does not accept arguments"
+    acquire_operation_lock
+    require_docker
+    compose stop --timeout 45 traceable-rag
+    ;;
+  status)
+    [ "$#" -eq 0 ] || die "status does not accept arguments"
+    require_docker
+    compose ps
+    printf 'livez=%s readyz=%s health=%s url=%s\n' "$(http_code /livez)" "$(http_code /readyz)" "$(http_code /api/health)" "$(base_url)"
+    ;;
+  setup-url)
+    [ "$#" -eq 0 ] || die "setup-url does not accept arguments"
+    show_setup_url
+    ;;
+  doctor)
+    doctor_command "$@"
+    ;;
+  logs)
+    require_docker
+    if [ "$#" -eq 0 ]; then
+      compose logs --tail 200 traceable-rag
+    else
+      compose logs "$@" traceable-rag
+    fi
+    ;;
+  backup)
+    [ "$#" -le 1 ] || die "usage: traceable-rag backup [label]"
+    acquire_operation_lock
+    require_docker
+    backup_command "${1:-}"
+    ;;
+  upgrade)
+    acquire_operation_lock
+    require_docker
+    upgrade_command "$@"
+    ;;
+  rollback)
+    [ "$#" -eq 0 ] || die "rollback does not accept arguments"
+    acquire_operation_lock
+    require_docker
+    rollback_command
+    ;;
+  recover)
+    [ "$#" -eq 0 ] || die "recover does not accept arguments"
+    acquire_operation_lock
+    require_docker
+    recover_command
+    ;;
+  agent)
+    if [ "${1:-}" = install-codex ]; then acquire_operation_lock; fi
+    require_docker
+    agent_command "$@"
+    ;;
+  admin)
+    acquire_operation_lock
+    require_docker
+    admin_command "$@"
+    ;;
+  uninstall)
+    acquire_operation_lock
+    require_docker
+    uninstall_command "$@"
+    ;;
+  *)
+    usage >&2
+    die "unknown command: $command_name"
+    ;;
+esac

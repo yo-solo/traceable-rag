@@ -1,0 +1,8 @@
+services:
+  traceable-rag:
+    ports: !override
+      - "127.0.0.1:${TRACEABLE_RAG_PORT:-8000}:8000"
+    volumes: !override
+      - "${TRACEABLE_RAG_DATA_DIR:-./.runtime/dev-data}:/data"
+      - "${TRACEABLE_RAG_DEV_SECRET_DIR:-./.runtime/dev-secrets}/master.key:/run/secrets/traceable-rag-master-key:ro"
+      - "${TRACEABLE_RAG_DEV_SECRET_DIR:-./.runtime/dev-secrets}/admin-token:/run/secrets/traceable-rag-admin-token:ro"

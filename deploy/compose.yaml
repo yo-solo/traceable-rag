@@ -1,0 +1,48 @@
+services:
+  traceable-rag:
+    image: ${TRACEABLE_RAG_IMAGE:?TRACEABLE_RAG_IMAGE must be an exact version tag or digest}
+    # The installer renders these placeholders to the invoking non-root host user.
+    user: "@TRACEABLE_RAG_CONTAINER_UID@:@TRACEABLE_RAG_CONTAINER_GID@"
+    init: true
+    restart: unless-stopped
+    ports:
+      - target: 8000
+        published: "${TRACEABLE_RAG_PORT:-8000}"
+        host_ip: "${TRACEABLE_RAG_BIND_ADDRESS:-127.0.0.1}"
+        protocol: tcp
+    environment:
+      TRACEABLE_RAG_DATABASE_PATH: /data/traceable_v3.db
+      TRACEABLE_RAG_MANAGED_STORAGE_ROOT: /data/managed
+      TRACEABLE_RAG_SETTINGS_PATH: /data/settings.json
+      TRACEABLE_RAG_STATIC_DIR: /app/web/dist
+      TRACEABLE_RAG_PROVIDER_STORE_PATH: /data/providers.db
+      TRACEABLE_RAG_MASTER_KEY_FILE: /run/secrets/traceable-rag-master-key
+      TRACEABLE_RAG_ADMIN_TOKEN_FILE: /run/secrets/traceable-rag-admin-token
+      TRACEABLE_RAG_TRUSTED_HOSTS: 127.0.0.1,localhost,::1
+    volumes:
+      - type: bind
+        source: ${TRACEABLE_RAG_DATA_DIR:?TRACEABLE_RAG_DATA_DIR must be configured}
+        target: /data
+      - type: bind
+        source: ${TRACEABLE_RAG_MASTER_KEY_HOST_FILE:?TRACEABLE_RAG_MASTER_KEY_HOST_FILE must be configured}
+        target: /run/secrets/traceable-rag-master-key
+        read_only: true
+      - type: bind
+        source: ${TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE:?TRACEABLE_RAG_ADMIN_TOKEN_HOST_FILE must be configured}
+        target: /run/secrets/traceable-rag-admin-token
+        read_only: true
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8000/readyz
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    stop_grace_period: 45s
+    security_opt:
+      - no-new-privileges:true

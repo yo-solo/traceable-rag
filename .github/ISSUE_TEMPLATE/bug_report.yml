@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a reproducible problem in Traceable RAG
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Remove secrets, private documents, personal data, and private endpoints before submitting. Security vulnerabilities must use the private reporting link below instead of this form.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Provide the release version, image digest, or commit tested.
+      placeholder: v0.5.0, sha256:..., or a Git commit
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Release installer
+        - Docker Compose
+        - Source checkout
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, Docker/Compose versions when relevant, and browser version for UI issues.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest reproducible sequence. Use synthetic or redistributable data only.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or screenshots
+      description: Remove credentials, tokens, private URLs, document content, local paths, and personal data.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true
+        - label: I removed secrets, private content, and personal data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
