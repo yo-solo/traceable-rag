@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@scalar/api-reference-react": "^0.9.60",
-    "@vitejs/plugin-react": "^5.0.0",
+    "@vitejs/plugin-react": "^6.0.5",
     "dompurify": "^3.4.13",
     "katex": "^0.18.1",
     "lucide-react": "^0.561.0",
