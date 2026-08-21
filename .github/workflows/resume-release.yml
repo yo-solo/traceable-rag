@@ -488,55 +488,81 @@ jobs:
             "$OUTPUT_DIR/SHA256SUMS"
           )
           release_json="$RUNNER_TEMP/traceable-rag-recovery-release.json"
-          release_error="$RUNNER_TEMP/traceable-rag-recovery-release.err"
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json" 2>"$release_error"; then
-            jq -e --arg tag "$RELEASE_TAG" '.draft == true and .tag_name == $tag' "$release_json" >/dev/null
-            jq -e '.assets | type == "array"' "$release_json" >/dev/null
-            jq -e '[.assets[].name] | length == (unique | length)' "$release_json" >/dev/null
-            while IFS= read -r existing_name; do
-              expected=false
-              for asset in "${assets[@]}"; do
-                if [ "$(basename "$asset")" = "$existing_name" ]; then
-                  expected=true
-                  break
-                fi
-              done
-              if [ "$expected" != true ]; then
-                echo "Existing draft contains unexpected asset: $existing_name" >&2
-                exit 1
-              fi
-            done < <(jq -r '.assets[].name' "$release_json")
-            missing=()
-            existing_dir=$(mktemp -d "$RUNNER_TEMP/traceable-rag-existing-assets.XXXXXX")
-            cleanup_existing() { rm -rf "$existing_dir"; }
-            trap cleanup_existing EXIT
-            for asset in "${assets[@]}"; do
-              name=$(basename "$asset")
-              asset_id=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' "$release_json")
-              if [ -z "$asset_id" ]; then
-                missing+=("$asset")
-                continue
-              fi
-              gh api \
-                -H 'Accept: application/octet-stream' \
-                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$existing_dir/$name"
-              cmp "$asset" "$existing_dir/$name"
-            done
-            if [ "${#missing[@]}" -gt 0 ]; then
-              gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "${missing[@]}"
-            fi
-          elif grep -q 'HTTP 404' "$release_error"; then
-            gh release create "$RELEASE_TAG" "${assets[@]}" \
+          release_pages="$RUNNER_TEMP/traceable-rag-recovery-release-pages.json"
+          release_matches="$RUNNER_TEMP/traceable-rag-recovery-release-matches.json"
+          list_matching_releases() {
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$release_pages"
+            jq --arg tag "$RELEASE_TAG" \
+              '[.[][] | select(.tag_name == $tag)]' \
+              "$release_pages" > "$release_matches"
+          }
+          list_matching_releases
+          match_count=$(jq 'length' "$release_matches")
+          if [ "$match_count" -eq 0 ]; then
+            gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
               --generate-notes \
               --title "Traceable RAG $RELEASE_TAG"
-          else
-            cat "$release_error" >&2
+            list_matching_releases
+            match_count=$(jq 'length' "$release_matches")
+          fi
+          if [ "$match_count" -ne 1 ]; then
+            echo "Expected exactly one Release matching tag $RELEASE_TAG; found $match_count" >&2
             exit 1
           fi
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
+          jq -e '.[0].draft == true' "$release_matches" >/dev/null
+          release_id=$(jq -r '.[0].id' "$release_matches")
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$release_json"
+          jq -e --arg tag "$RELEASE_TAG" --argjson id "$release_id" \
+            '.id == $id and .draft == true and .tag_name == $tag and (.assets | type == "array")' \
+            "$release_json" >/dev/null
+          jq -e '[.assets[].name] | length == (unique | length)' "$release_json" >/dev/null
+          while IFS= read -r existing_name; do
+            expected=false
+            for asset in "${assets[@]}"; do
+              if [ "$(basename "$asset")" = "$existing_name" ]; then
+                expected=true
+                break
+              fi
+            done
+            if [ "$expected" != true ]; then
+              echo "Existing draft contains unexpected asset: $existing_name" >&2
+              exit 1
+            fi
+          done < <(jq -r '.assets[].name' "$release_json")
+          existing_dir=$(mktemp -d "$RUNNER_TEMP/traceable-rag-existing-assets.XXXXXX")
+          cleanup_existing() { rm -rf "$existing_dir"; }
+          trap cleanup_existing EXIT
+          for asset in "${assets[@]}"; do
+            name=$(basename "$asset")
+            asset_id=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' "$release_json")
+            if [ -n "$asset_id" ]; then
+              gh api \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$existing_dir/$name"
+              cmp "$asset" "$existing_dir/$name"
+              continue
+            fi
+            encoded_name=$(jq -rn --arg value "$name" '$value | @uri')
+            upload_json="$RUNNER_TEMP/traceable-rag-upload-$name.json"
+            curl --fail --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'Content-Type: application/octet-stream' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --data-binary "@$asset" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$encoded_name" \
+              > "$upload_json"
+            jq -e --arg name "$name" \
+              '.name == $name and .state == "uploaded" and .size > 0' \
+              "$upload_json" >/dev/null
+          done
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$release_json"
           python - "$release_json" "$RELEASE_TAG" <<'PY'
           import json
           from pathlib import Path

@@ -111,6 +111,13 @@ def test_resume_release_keeps_version_immutable_and_aliases_last() -> None:
     assert "--verify-tag" in draft
     assert "--draft" in draft
     assert "--clobber" not in draft
+    assert "releases/tags/" not in draft
+    assert "gh release upload" not in draft
+    assert "--paginate --slurp" in draft
+    assert "releases?per_page=100" in draft
+    assert "Expected exactly one Release matching tag" in draft
+    assert "releases/$release_id" in draft
+    assert "uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets" in draft
     assert "Existing draft contains unexpected asset" in draft
     assert "exactly eight expected assets" in draft
     assert aliases.count("docker buildx imagetools create") == 1
