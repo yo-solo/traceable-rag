@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import re
 import tomllib
 
 import pytest
@@ -101,6 +102,7 @@ def test_ci_and_release_workflows_use_current_retrieval_surfaces() -> None:
         assert marker in ci
     assert "scripts/release_api_smoke.py" in release
     assert "tests/test_deployment_experience.py" in release
+    assert "tests/test_release_acceptance_seed.py" in release
     assert "sh -n install.sh deploy/traceable-rag" in release
     assert "fetch-depth: 0" in release
     assert "+refs/heads/main:refs/remotes/origin/main" in release
@@ -117,15 +119,53 @@ def test_ci_and_release_workflows_use_current_retrieval_surfaces() -> None:
     assert "--db /data/traceable_v3.db" in release
     assert "--db /data/traceable_v2.db" not in release
     assert "Retrieval and Source acceptance" in release
-    assert "--processing-attempts 3" in release
-    assert "--retry-delay-seconds 15" in release
-    assert "$GITHUB_WORKSPACE/examples/vidore/documents:/input:ro" in release
+    assert "scripts/seed_release_acceptance.py" in release
+    assert "$GITHUB_WORKSPACE/examples/vidore:/input:ro" in release
+    assert "--manifest /input/manifest.json" in release
     assert "--expected-document-count 4" in release
     assert "/retrieval" in release
     assert '"http://127.0.0.1:18001/sources/$SOURCE_ID"' in release
     assert "/query" not in ci
     assert "/query" not in release
     assert "/traces" not in release
+
+
+def test_public_release_is_provider_free_and_staged_as_a_draft() -> None:
+    release = _read(".github/workflows/release.yml")
+    acceptance = _workflow_step(
+        release,
+        "Build deterministic public ViDoRe acceptance corpus inside the candidate image",
+    )
+    runtime = _workflow_step(release, "Start the accepted candidate image")
+    publish = _workflow_step(
+        release, "Publish deployment bundle as GitHub Release assets"
+    )
+
+    secret_references = set(
+        re.findall(r"\bsecrets\.[A-Za-z_][A-Za-z0-9_]*\b", release)
+    )
+    assert secret_references == {"secrets.GITHUB_TOKEN"}
+    assert acceptance.count('--user "$(id -u):$(id -g)"') == 1
+    assert acceptance.count("--network none") == 1
+    assert runtime.count('--user "$(id -u):$(id -g)"') == 1
+    assert "seed_release_acceptance.py" in acceptance
+    assert "draft: true" in publish
+
+
+def test_release_images_declare_the_public_source_before_the_first_push() -> None:
+    dockerfile = _read("Dockerfile")
+    release = _read(".github/workflows/release.yml")
+    amd64_build = _workflow_step(
+        release, "Build the candidate image without publishing it"
+    )
+    arm64_build = _workflow_step(
+        release, "Build and run the arm64 candidate under QEMU"
+    )
+
+    assert "ARG TRACEABLE_RAG_SOURCE_URL=https://github.com/yo-solo/traceable-rag" in dockerfile
+    assert 'org.opencontainers.image.source="$TRACEABLE_RAG_SOURCE_URL"' in dockerfile
+    for build in (amd64_build, arm64_build):
+        assert '--build-arg "TRACEABLE_RAG_SOURCE_URL=https://github.com/$GITHUB_REPOSITORY"' in build
 
 
 def test_public_release_uses_an_isolated_ghcr_package() -> None:
@@ -171,7 +211,8 @@ def test_release_workflow_preserves_exact_accepted_image_identity() -> None:
         release, "Build and run the arm64 candidate under QEMU"
     )
     document_acceptance = _workflow_step(
-        release, "Process all four public ViDoRe samples inside the candidate image"
+        release,
+        "Build deterministic public ViDoRe acceptance corpus inside the candidate image",
     )
     amd64_runtime = _workflow_step(release, "Start the accepted candidate image")
     amd64_sbom = _workflow_step(release, "Generate amd64 candidate SBOM")
@@ -237,6 +278,15 @@ def test_release_workflow_preserves_exact_accepted_image_identity() -> None:
     assert "${{ steps.build_arm64.outputs.image_id }}" in push_platforms
     assert push_platforms.count("docker push") == 2
     assert "docker buildx build" not in push_platforms
+    source_inspection = (
+        "docker image inspect --format "
+        "'{{ index .Config.Labels \"org.opencontainers.image.source\" }}'"
+    )
+    assert 'expected_source="https://github.com/yo-solo/traceable-rag"' in push_platforms
+    assert push_platforms.count(source_inspection) == 2
+    assert push_platforms.rindex(source_inspection) < push_platforms.index(
+        "docker push"
+    )
     assert push_platforms.count(
         "python scripts/verify_release_image_identity.py platform"
     ) == 2
@@ -271,7 +321,7 @@ def test_release_workflow_preserves_exact_accepted_image_identity() -> None:
 
     ordered_steps = (
         "Build the candidate image without publishing it",
-        "Process all four public ViDoRe samples inside the candidate image",
+        "Build deterministic public ViDoRe acceptance corpus inside the candidate image",
         "Generate amd64 candidate SBOM",
         "Block critical amd64 candidate vulnerabilities",
         "Build and run the arm64 candidate under QEMU",

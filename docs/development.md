@@ -89,7 +89,9 @@ Health
 → Source verification HTML route
 ```
 
-它不调用内置 LLM，也不创建 Query/Trace。Release 流水线从 smoke 报告读取运行时返回的 Source ID，生成 Retrieval 与 Source 页面截图。
+Release 流水线先用 `scripts/seed_release_acceptance.py` 校验四份公开 PDF 的固定哈希，再从其真实页面文本和内嵌图片构建确定性、本地、无 Provider 密钥的全新验收库。`scripts/release_api_smoke.py` 不调用内置 LLM，也不创建 Query/Trace；它从运行时返回的 Source ID 继续验证 Retrieval、Source Context、原页资源与页面路由，并生成 Retrieval 与 Source 页面截图。
+
+这条门禁不会把真实 MinerU 或 Dense/Reranker Provider E2E 伪装成已执行。联网 Provider 验收需在受控部署中单独运行并明确记录结果。
 
 ## 发布门槛
 

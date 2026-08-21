@@ -7,10 +7,12 @@
 每个 `vX.Y.Z` Git tag 只有在以下门禁全部通过后才发布：
 
 1. tag commit 是 `origin/main` 的祖先；
-2. amd64 候选镜像完成真实文档、Retrieval、Source、浏览器、SBOM 和关键漏洞验收；
+2. amd64 候选镜像校验四份公开 ViDoRe PDF 的固定哈希，并用确定性本地语料构建全新数据库，完成关键词 Retrieval、Source、浏览器、SBOM 和关键漏洞验收；
 3. arm64 候选镜像在 QEMU 下实际启动，`/readyz`、`/livez` 和 `libreoffice --version` 通过；
 4. 验收之后才登录 GHCR，并发布包含 `linux/amd64`、`linux/arm64` 的 manifest；
 5. GitHub Release 同时附带 `install.sh`、`install.ps1`、POSIX/PowerShell 管理入口、Compose bundle 和 `SHA256SUMS`。
+
+发布门禁不读取真实 MinerU、Embedding、Reranker 或 LLM 密钥，也不依赖供应商额度和网络稳定性。它验证的是固定公开 PDF、归一化与索引、关键词 Retrieval、Source Context、原页资源和 UI 的确定性闭环。真实 MinerU 文档处理及 Dense/Reranker Provider E2E 属于部署后的显式验收项；没有执行时必须标记为未测试，不能由发布门禁推定为通过。
 
 安装器从明确的版本 Release 下载 bundle、独立 `release-manifest.json` 和 `SHA256SUMS`，同时核对 bundle 内清单与独立清单完全一致。清单固定版本、源码 commit、多架构 platform digest 和最终 index digest；Compose 中没有 `build`，运行配置直接使用 `image@index_digest`。升级也必须显式给出版本。
 

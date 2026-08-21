@@ -4,9 +4,21 @@
 
 ## 1. 安装已发布版本
 
-准备 Docker Desktop，或 Linux Docker Engine + Compose v2。把 `vX.Y.Z` 替换为 Releases 页面中的明确版本。
+准备 Docker Desktop，或 Linux Docker Engine + Compose v2。当前公开版本为 `v0.5.0`。
 
-公开 Release 与 GHCR package 发布以后，安装器可以匿名下载固定版本发布物。首个公开 Release 尚未发布时，请使用本文末尾的源码开发入口。受限镜像、私有 fork 或企业镜像若要求认证，先登录 GitHub CLI 与 GHCR，再下载、校验并运行本地发布物。
+公开 Release 与 GHCR package 可以匿名下载。Linux / macOS 使用下面的一行命令；它会继续下载并验证 manifest、bundle 校验和与固定镜像 digest。
+
+```bash
+curl -fsSL https://github.com/yo-solo/traceable-rag/releases/download/v0.5.0/install.sh | sh
+```
+
+Windows PowerShell 使用：
+
+```powershell
+irm https://github.com/yo-solo/traceable-rag/releases/download/v0.5.0/install.ps1 | iex
+```
+
+安全敏感环境建议从 [`v0.5.0` 发布页](https://github.com/yo-solo/traceable-rag/releases/tag/v0.5.0)下载全部文件，先逐项验证 `SHA256SUMS`，再运行本地安装器。受限镜像、私有 fork 或企业镜像若要求认证，先登录 GitHub CLI 与 GHCR，再下载、校验并运行本地发布物。
 
 需要 GitHub 认证时的 macOS / Linux 安装方式如下。
 
@@ -15,13 +27,13 @@ gh auth login
 gh auth refresh -h github.com -s read:packages
 gh auth token | docker login ghcr.io -u "$(gh api user --jq .login)" --password-stdin
 tmp=$(mktemp -d)
-gh release download vX.Y.Z --repo yo-solo/traceable-rag --dir "$tmp"
+gh release download v0.5.0 --repo yo-solo/traceable-rag --dir "$tmp"
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$tmp" && sha256sum -c SHA256SUMS)
 else
   (cd "$tmp" && shasum -a 256 -c SHA256SUMS)
 fi
-tar -xzf "$tmp/traceable-rag-deployment-vX.Y.Z.tar.gz" -C "$tmp"
+tar -xzf "$tmp/traceable-rag-deployment-v0.5.0.tar.gz" -C "$tmp"
 chmod 700 "$tmp/install.sh"
 "$tmp/install.sh"
 ```
@@ -31,7 +43,7 @@ chmod 700 "$tmp/install.sh"
 ```powershell
 gh auth login
 gh auth refresh -h github.com -s read:packages
-$Version = "vX.Y.Z"
+$Version = "v0.5.0"
 $User = gh api user --jq .login
 gh auth token | docker login ghcr.io -u $User --password-stdin
 $Temp = Join-Path ([IO.Path]::GetTempPath()) "traceable-rag-$([guid]::NewGuid())"
@@ -46,7 +58,7 @@ Expand-Archive -LiteralPath (Join-Path $Temp "traceable-rag-deployment-$Version.
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $Temp "install.ps1")
 ```
 
-Release 与 package 公开后，可以分别简化为 `curl .../install.sh | sh` 或 `irm .../install.ps1 | iex`。安全敏感环境仍建议先下载 `SHA256SUMS` 并校验，再运行本地安装器。安装器不会绕过受限发布物的访问权限。
+安装器不会绕过受限发布物的访问权限，也不会把 GitHub 或 GHCR token 写入本地配置。
 
 安装器只拉取固定版本的 `linux/amd64` 或 `linux/arm64` GHCR 镜像，不在本机编译项目。默认绑定 `127.0.0.1:8000`，独立创建配置、数据、状态、备份目录，并生成不会写入 env 的 32-byte 主密钥和管理 token。受限 Release 或 package 需先完成对应的 GitHub 下载授权与 `docker login ghcr.io`。
 

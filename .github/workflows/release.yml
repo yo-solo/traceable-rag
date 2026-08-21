@@ -42,19 +42,6 @@ jobs:
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
-      - name: Validate release secrets
-        env:
-          MINERU_TOKEN: ${{ secrets.MINERU_TOKEN }}
-          OPENAI_EMBEDDING_BASE_URL: ${{ secrets.OPENAI_EMBEDDING_BASE_URL }}
-          OPENAI_EMBEDDING_API_KEY: ${{ secrets.OPENAI_EMBEDDING_API_KEY }}
-          OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
-        shell: bash
-        run: |
-          test -n "$MINERU_TOKEN"
-          test -n "$OPENAI_EMBEDDING_BASE_URL"
-          test -n "$OPENAI_EMBEDDING_API_KEY"
-          test -n "$OPENAI_EMBEDDING_MODEL"
-
       - name: Check OpenAPI, Skill, and release contracts
         run: |
           python -m pip install -e '.[dev]'
@@ -62,6 +49,7 @@ jobs:
             tests/test_openapi.py \
             tests/test_codex_skill_template.py \
             tests/test_release_contract.py \
+            tests/test_release_acceptance_seed.py \
             tests/test_deployment_experience.py
           sh -n install.sh deploy/traceable-rag
 
@@ -81,6 +69,7 @@ jobs:
             --platform linux/amd64 \
             --load \
             --tag traceable-rag:candidate \
+            --build-arg "TRACEABLE_RAG_SOURCE_URL=https://github.com/$GITHUB_REPOSITORY" \
             --cache-from type=gha,scope=release-amd64 \
             --cache-to type=gha,mode=max,scope=release-amd64 \
             .
@@ -89,41 +78,29 @@ jobs:
           test "$platform" = linux/amd64
           echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
 
-      - name: Process all four public ViDoRe samples inside the candidate image
-        env:
-          MINERU_TOKEN: ${{ secrets.MINERU_TOKEN }}
-          OPENAI_EMBEDDING_BASE_URL: ${{ secrets.OPENAI_EMBEDDING_BASE_URL }}
-          OPENAI_EMBEDDING_API_KEY: ${{ secrets.OPENAI_EMBEDDING_API_KEY }}
-          OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
+      - name: Build deterministic public ViDoRe acceptance corpus inside the candidate image
         shell: bash
         run: |
           runtime="$RUNNER_TEMP/traceable-rag-release"
           mkdir -p "$runtime/data/home" "$runtime/data/managed" .artifacts/release/screenshots
           chmod 0777 "$runtime/data" "$runtime/data/home" "$runtime/data/managed"
           docker run --rm \
-            --env MINERU_TOKEN \
-            --env OPENAI_EMBEDDING_BASE_URL \
-            --env OPENAI_EMBEDDING_API_KEY \
-            --env OPENAI_EMBEDDING_MODEL \
-            --volume "$GITHUB_WORKSPACE/examples/vidore/documents:/input:ro" \
+            --network none \
+            --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE/examples/vidore:/input:ro" \
+            --volume "$GITHUB_WORKSPACE/scripts/seed_release_acceptance.py:/release/seed_release_acceptance.py:ro" \
             --volume "$runtime/data:/data" \
             traceable-rag:candidate \
-            python -m traceable_rag.cli acceptance-corpus \
-              --source-dir /input \
+            python /release/seed_release_acceptance.py \
+              --source-dir /input/documents \
+              --manifest /input/manifest.json \
               --db /data/traceable_v3.db \
               --storage-root /data/managed \
               --expected-document-count 4 \
-              --processing-attempts 3 \
-              --retry-delay-seconds 15 \
               --report /data/acceptance.json
           cp "$runtime/data/acceptance.json" .artifacts/release/acceptance.json
 
       - name: Start the accepted candidate image
-        env:
-          MINERU_TOKEN: ${{ secrets.MINERU_TOKEN }}
-          OPENAI_EMBEDDING_BASE_URL: ${{ secrets.OPENAI_EMBEDDING_BASE_URL }}
-          OPENAI_EMBEDDING_API_KEY: ${{ secrets.OPENAI_EMBEDDING_API_KEY }}
-          OPENAI_EMBEDDING_MODEL: ${{ secrets.OPENAI_EMBEDDING_MODEL }}
         shell: bash
         run: |
           runtime="$RUNNER_TEMP/traceable-rag-release"
@@ -135,10 +112,6 @@ jobs:
             --name traceable-rag-release \
             --user "$(id -u):$(id -g)" \
             --publish 127.0.0.1:18001:8000 \
-            --env MINERU_TOKEN \
-            --env OPENAI_EMBEDDING_BASE_URL \
-            --env OPENAI_EMBEDDING_API_KEY \
-            --env OPENAI_EMBEDDING_MODEL \
             --env TRACEABLE_RAG_PROVIDER_STORE_PATH=/data/providers.db \
             --env TRACEABLE_RAG_MASTER_KEY_FILE=/run/secrets/traceable-rag-master-key \
             --env TRACEABLE_RAG_ADMIN_TOKEN_FILE=/run/secrets/traceable-rag-admin-token \
@@ -199,6 +172,7 @@ jobs:
             --platform linux/arm64 \
             --load \
             --tag traceable-rag:candidate-arm64 \
+            --build-arg "TRACEABLE_RAG_SOURCE_URL=https://github.com/$GITHUB_REPOSITORY" \
             --cache-from type=gha,scope=release-arm64 \
             --cache-to type=gha,mode=max,scope=release-arm64 \
             .
@@ -314,8 +288,11 @@ jobs:
           set -euo pipefail
           amd64_tag="$PLATFORM_PREFIX-amd64"
           arm64_tag="$PLATFORM_PREFIX-arm64"
+          expected_source="https://github.com/yo-solo/traceable-rag"
           test "$(docker image inspect --format '{{.Id}}' traceable-rag:candidate)" = "$AMD64_IMAGE_ID"
           test "$(docker image inspect --format '{{.Id}}' traceable-rag:candidate-arm64)" = "$ARM64_IMAGE_ID"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' traceable-rag:candidate)" = "$expected_source"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' traceable-rag:candidate-arm64)" = "$expected_source"
           docker tag traceable-rag:candidate "$IMAGE:$amd64_tag"
           docker tag traceable-rag:candidate-arm64 "$IMAGE:$arm64_tag"
           docker push "$IMAGE:$amd64_tag"
@@ -497,6 +474,7 @@ jobs:
       - name: Publish deployment bundle as GitHub Release assets
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

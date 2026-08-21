@@ -20,6 +20,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/code-MIT-514BB8.svg"></a>
+  <a href="https://github.com/yo-solo/traceable-rag/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/yo-solo/traceable-rag?display_name=tag&sort=semver&color=514BB8"></a>
   <a href="https://github.com/yo-solo/traceable-rag/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yo-solo/traceable-rag/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-202033.svg">
   <img alt="Docker on Linux" src="https://img.shields.io/badge/Docker-Linux-6B65D8.svg">
@@ -44,15 +45,13 @@ Traceable RAG 为 Codex 等外部 AI 智能体提供文档证据检索。它处�
 
 ## Linux 快速启动
 
-先准备 Git、Docker Engine 和 Docker Compose v2。首个公开 Release 发布前，源码部署是当前可验证的入口。
+先在 Linux `amd64` 或 `arm64` 环境准备 Docker Engine 和 Docker Compose v2，然后安装固定的 `v0.5.0`：
 
 ```bash
-git clone https://github.com/yo-solo/traceable-rag.git
-cd traceable-rag
-./scripts/deploy_local.sh
+curl -fsSL https://github.com/yo-solo/traceable-rag/releases/download/v0.5.0/install.sh | sh
 ```
 
-健康检查通过后，打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。脚本会构建当前代码，按你的非 root UID/GID 启动容器，同时创建隔离数据目录和仅保留在本机的管理密钥、加密主密钥。
+安装器会验证 Release manifest 和 bundle 校验和，固定已经验收的多架构镜像 digest，按你的非 root UID/GID 启动容器，并且只监听 `127.0.0.1:8000`。它还会创建隔离数据目录，以及只保留在本机的管理密钥和加密主密钥。健康检查通过后，打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。
 
 进入设置页配置 MinerU。Embedding 和 Reranker 可以按需配置。Provider 密钥由本人在浏览器中填写，加密后再持久化，不会写入部署环境文件。
 
@@ -65,7 +64,9 @@ cd traceable-rag
 - 欧盟收入不平等在 2014 至 2015 年峰值以后怎样变化
 - 面向未来的职业中，性别隔离在图表里呈现出什么特点
 
-首个公开 `v0.5.0` Release 还会提供校验和安装器，以及发布在 `ghcr.io/yo-solo/traceable-rag-public` 的固定多架构镜像。Release 与 package 真正公开并完成验收以前，README 不把匿名安装链接写成已经可用的能力。
+[`v0.5.0` 发布页](https://github.com/yo-solo/traceable-rag/releases/tag/v0.5.0)提供安装器、SBOM、校验和与不可变镜像清单。公开镜像为 `ghcr.io/yo-solo/traceable-rag-public`，安装器始终使用精确 digest，不使用 `latest`。
+
+如需源码开发，可以 clone 仓库后运行 `./scripts/deploy_local.sh`。校验和优先安装、Windows PowerShell、自定义端口和生命周期命令见[快速上手](docs/getting-started.md)。
 
 ## 从问题走到原文
 

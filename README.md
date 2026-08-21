@@ -20,6 +20,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/code-MIT-514BB8.svg"></a>
+  <a href="https://github.com/yo-solo/traceable-rag/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/yo-solo/traceable-rag?display_name=tag&sort=semver&color=514BB8"></a>
   <a href="https://github.com/yo-solo/traceable-rag/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yo-solo/traceable-rag/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-202033.svg">
   <img alt="Docker on Linux" src="https://img.shields.io/badge/Docker-Linux-6B65D8.svg">
@@ -44,15 +45,13 @@ Most RAG demos stop at a plausible paragraph and a filename. Traceable RAG keeps
 
 ## Linux quickstart
 
-You need Git, Docker Engine, and Docker Compose v2. The source path works before the first public Release is published.
+You need Docker Engine and Docker Compose v2 on Linux `amd64` or `arm64`. Install the exact `v0.5.0` release:
 
 ```bash
-git clone https://github.com/yo-solo/traceable-rag.git
-cd traceable-rag
-./scripts/deploy_local.sh
+curl -fsSL https://github.com/yo-solo/traceable-rag/releases/download/v0.5.0/install.sh | sh
 ```
 
-When the health check passes, open [http://127.0.0.1:8000](http://127.0.0.1:8000). The script builds the current checkout, runs the container as your non-root UID/GID, creates isolated local data, and generates local-only admin and encryption secrets.
+The installer verifies the release manifest and bundle checksum, pins the accepted multi-architecture image by digest, runs it as your non-root UID/GID, and binds only to `127.0.0.1:8000`. It creates isolated data directories plus local-only admin and encryption secrets. When the health check passes, open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
 Configure MinerU and, optionally, Embedding and Reranker providers on the setup page. Provider keys are entered in the browser, encrypted before persistence, and never written to the deployment environment file.
 
@@ -65,7 +64,9 @@ Try these questions:
 - How did EU income inequality change after the 2014–15 peak?
 - What does the chart show about gender segregation in future-oriented occupations?
 
-The first public `v0.5.0` Release will also provide a checksum-verified installer and a fixed multi-architecture image at `ghcr.io/yo-solo/traceable-rag-public`. Until both the Release and package are public and accepted, anonymous installer URLs are intentionally not presented as live.
+Release assets, SBOMs, checksums, and the immutable image manifest are available on the [`v0.5.0` release page](https://github.com/yo-solo/traceable-rag/releases/tag/v0.5.0). The public image is `ghcr.io/yo-solo/traceable-rag-public`; installers consume its exact digest, never `latest`.
+
+For source development instead, clone the repository and run `./scripts/deploy_local.sh`. See [Getting started](docs/getting-started.md) for checksum-first installation, Windows PowerShell, custom ports, and lifecycle commands.
 
 ## The verification loop
 

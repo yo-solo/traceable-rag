@@ -11,6 +11,13 @@ RUN npm run build
 
 FROM python:3.12-slim-bookworm AS runtime
 
+ARG TRACEABLE_RAG_SOURCE_URL=https://github.com/yo-solo/traceable-rag
+
+LABEL org.opencontainers.image.title="Traceable RAG" \
+      org.opencontainers.image.description="Verifiable document retrieval and Source context for AI agents." \
+      org.opencontainers.image.source="$TRACEABLE_RAG_SOURCE_URL" \
+      org.opencontainers.image.licenses="MIT"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HOME=/data/home \
