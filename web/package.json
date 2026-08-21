@@ -21,7 +21,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "7.18.2",
-    "typescript": "^5.8.0",
+    "typescript": "^7.0.2",
     "vite": "7.3.6"
   },
   "devDependencies": {
