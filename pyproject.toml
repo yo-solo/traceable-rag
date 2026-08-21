@@ -25,7 +25,7 @@ dependencies = [
   "fastapi>=0.115",
   "pillow>=11.0",
   "uvicorn[standard]>=0.30",
-  "pypdf==6.15.0",
+  "pypdf==6.16.1",
 ]
 
 [project.optional-dependencies]
