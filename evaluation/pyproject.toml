@@ -13,7 +13,7 @@ dependencies = [
   "huggingface-hub>=0.27",
   "numpy>=1.26",
   "pyarrow>=18.0",
-  "pytrec-eval-terrier==0.5.10",
+  "pytrec-eval-terrier==0.5.11",
 ]
 
 [project.scripts]
